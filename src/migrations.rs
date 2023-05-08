@@ -1,22 +1,20 @@
 use std::collections::BinaryHeap;
 use std::cmp::Reverse;
-use std::sync::Arc;
 
-type MigrationFn<Ctx> = dyn Fn(&rusqlite::Connection, &Ctx) -> rusqlite::Result<()>;
+type MigrationFn<E> = dyn Send + 'static + Fn(&rusqlite::Connection) -> Result<(), E>;
 
 /// Define a set of migrations to apply to an SQLite connection.
-#[derive(Clone)]
-pub struct Migrations<Ctx> {
-    migrations: BinaryHeap<Reverse<Migration<Ctx>>>
+pub struct Migrations<E> {
+    migrations: BinaryHeap<Reverse<Migration<E>>>
 }
 
-impl <Ctx> Default for Migrations<Ctx> {
+impl <E> Default for Migrations<E> {
     fn default() -> Self {
         Migrations::new()
     }
 }
 
-impl <Ctx> Migrations<Ctx> {
+impl <E> Migrations<E> {
     /// Construct a new set of migrations,
     pub fn new() -> Self {
         Migrations {
@@ -30,41 +28,40 @@ impl <Ctx> Migrations<Ctx> {
     /// Migrations should never be removed or changed once they have been
     /// applied to a DB somewhere.
     pub fn add<F>(&mut self, version: i32, migration: F) -> &mut Self
-    where F: Fn(&rusqlite::Connection, &Ctx) -> rusqlite::Result<()> + 'static
+    where F: Fn(&rusqlite::Connection) -> Result<(), E> + Send + 'static
     {
-        let migration = Arc::new(migration);
+        let migration = Box::new(migration);
         self.migrations.push(Reverse(Migration { version, migration }));
         self
     }
 
     /// Iterate over the migrations, lowest to highest version.
-    pub fn iter(&self) -> impl Iterator<Item = (i32, &MigrationFn<Ctx>)> {
+    pub fn iter(&self) -> impl Iterator<Item = (i32, &MigrationFn<E>)> {
         self.migrations.iter().map(|Reverse(m)| (m.version, &*m.migration))
     }
 }
 
 /// Migrations are ordered by their version.
-#[derive(Clone)]
-struct Migration<Ctx> {
+struct Migration<E> {
     version: i32,
-    migration: Arc<MigrationFn<Ctx>>
+    migration: Box<MigrationFn<E>>
 }
 
-impl <Ctx> PartialEq for Migration<Ctx> {
+impl <E> PartialEq for Migration<E> {
     fn eq(&self, other: &Self) -> bool {
         self.version == other.version
     }
 }
 
-impl <Ctx> Eq for Migration<Ctx> {}
+impl <E> Eq for Migration<E> {}
 
-impl <Ctx> Ord for Migration<Ctx> {
+impl <E> Ord for Migration<E> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.version.cmp(&other.version)
     }
 }
 
-impl <Ctx> PartialOrd for Migration<Ctx> {
+impl <E> PartialOrd for Migration<E> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         self.version.partial_cmp(&other.version)
     }
