@@ -9,8 +9,8 @@ license = "MIT"
 [dependencies]
 async-rusqlite = "0.3.0"
 # Just to ask for specific features from the underlying rusqlite,
-# so let it pick whatever version aligns with the above:
-rusqlite = { version = "*", features = ["bundled"] }
+# so use same version as above:
+rusqlite = { version = "0.29.0", features = ["bundled"] }
 
 [dev-dependencies]
 tokio = { version = "1.28.0", features = ["rt-multi-thread", "macros"] }
