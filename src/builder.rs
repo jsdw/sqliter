@@ -7,7 +7,7 @@ use crate::error::ConnectionBuilderError;
 /// An opinionated connection builder which ultimately hands back
 /// an [`async_rusqlite::Connection`] after checking the app ID and
 /// performing any necessary migrations.
-pub struct ConnectionBuilder<E> {
+pub struct ConnectionBuilder<E = rusqlite::Error> {
     // PRAGMA application_id = INTEGER; default 0
     app_id: i32,
     // Migrations to apply

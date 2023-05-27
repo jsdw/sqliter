@@ -1,6 +1,6 @@
 [package]
 name = "sqliter"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["james@jsdw.me"]
 description = "An opinionated async connnection/migration handler for rusqlite to make light work of using sqlite databases for small apps"
@@ -8,8 +8,6 @@ license = "MIT"
 
 [dependencies]
 async-rusqlite = "0.3.0"
-# Just to ask for specific features from the underlying rusqlite,
-# so use same version as above:
 rusqlite = { version = "0.29.0", features = ["bundled"] }
 
 [dev-dependencies]
