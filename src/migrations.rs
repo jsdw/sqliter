@@ -4,7 +4,7 @@ use std::cmp::Reverse;
 type MigrationFn<E> = dyn Send + 'static + Fn(&rusqlite::Connection) -> Result<(), E>;
 
 /// Define a set of migrations to apply to an SQLite connection.
-pub struct Migrations<E> {
+pub struct Migrations<E = rusqlite::Error> {
     migrations: BinaryHeap<Reverse<Migration<E>>>
 }
 
@@ -27,7 +27,7 @@ impl <E> Migrations<E> {
     /// user_version is set in the DB to record the version we're up to.
     /// Migrations should never be removed or changed once they have been
     /// applied to a DB somewhere.
-    pub fn add<F>(&mut self, version: i32, migration: F) -> &mut Self
+    pub fn add<F>(mut self, version: i32, migration: F) -> Self
     where F: Fn(&rusqlite::Connection) -> Result<(), E> + Send + 'static
     {
         let migration = Box::new(migration);

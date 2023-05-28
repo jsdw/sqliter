@@ -38,7 +38,7 @@ impl <E: Send + 'static> ConnectionBuilder<E> {
     where
         F: Send + 'static + Fn(&rusqlite::Connection) -> Result<(), E>
     {
-        self.migrations.add(version, migration);
+        self.migrations = self.migrations.add(version, migration);
         self
     }
 
