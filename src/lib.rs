@@ -51,3 +51,228 @@ pub use migrations::Migrations;
 
 // Export these since we are just a thin wrapper around them.
 pub use async_rusqlite::{ self, rusqlite, Connection };
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn users_table(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+        conn.execute_batch("
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL
+            ) STRICT;
+
+            INSERT INTO users VALUES (1, 'James');
+            INSERT INTO users VALUES (2, 'Bob');
+            ",
+        )?;
+        Ok(())
+    }
+
+    fn data_table(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+        conn.execute_batch("
+            CREATE TABLE data (
+                owner INTEGER NOT NULL,
+                text TEXT NOT NULL,
+
+                FOREIGN KEY(owner) REFERENCES users(id)
+            ) STRICT;
+
+            INSERT INTO data VALUES (1, 'James data');
+        ")
+    }
+
+    async fn get_app_id(conn: &Connection) -> i32 {
+        conn.call(|conn| {
+            conn.query_row(
+                "SELECT * from pragma_application_id",
+                [],
+                |row| row.get(0)
+            )
+        }).await.unwrap()
+    }
+
+    async fn get_user_version(conn: &Connection) -> i32 {
+        conn.call(|conn| {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+        }).await.expect("user_version expected")
+    }
+
+    #[tokio::test]
+    #[should_panic]
+    async fn invalid_migration_version() {
+        ConnectionBuilder::new()
+            .add_migration(0, users_table)
+            .open_in_memory()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_is_applied() {
+        let conn = ConnectionBuilder::new()
+            .add_migration(7, users_table)
+            .open_in_memory()
+            .await
+            .unwrap();
+
+        // version should align:
+        assert_eq!(get_user_version(&conn).await, 7);
+
+        // table should be accessible and contain what the migration added:
+        let name: String = conn.call(|conn| {
+            conn.query_row("SELECT name FROM users WHERE id = 1", [], |row| row.get(0))
+        }).await.unwrap();
+        assert_eq!(name, "James");
+    }
+
+    #[tokio::test]
+    async fn new_migrations_applied_as_needed() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test-db1.app");
+
+        // open first time with 1 migration:
+        let conn = ConnectionBuilder::new()
+            .add_migration(1, users_table)
+            .open(&path)
+            .await
+            .unwrap();
+
+        assert_eq!(get_user_version(&conn).await, 1);
+        drop(conn);
+
+        // open again with 2 migrations:
+        let conn = ConnectionBuilder::new()
+            .add_migration(1, users_table)
+            .add_migration(2, data_table)
+            .open(&path)
+            .await
+            .unwrap();
+
+        assert_eq!(get_user_version(&conn).await, 2);
+
+        // Ensure both migrations applied:
+        let id: i32 = conn.call(|conn| {
+            conn.query_row("
+                SELECT users.id FROM data JOIN users ON data.owner = users.id
+                WHERE data.text = 'James data';
+            ", [], |row| row.get(0))
+        }).await.unwrap();
+        assert_eq!(id, 1);
+    }
+
+    #[tokio::test]
+    async fn app_id_is_set_and_used() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test-db2.app");
+
+        const APP_ID: i32 = 12345;
+        const DIFFERENT_APP_ID: i32 = 76543;
+
+        // Should be no issues on initial opening:
+        let conn = ConnectionBuilder::new()
+            .app_id(APP_ID)
+            .add_migration(1, users_table)
+            .open(&path)
+            .await
+            .expect("can open db");
+
+        assert_eq!(get_app_id(&conn).await, APP_ID);
+        drop(conn);
+
+        // Open again with same app ID should work:
+        let conn = ConnectionBuilder::new()
+            .app_id(APP_ID)
+            .add_migration(1, users_table)
+            .open(&path)
+            .await
+            .expect("can open db");
+
+        assert_eq!(get_app_id(&conn).await, APP_ID);
+        drop(conn);
+
+        // Open again with different app ID should fail:
+        let conn = ConnectionBuilder::new()
+            .app_id(DIFFERENT_APP_ID)
+            .add_migration(1, users_table)
+            .open(&path)
+            .await;
+
+        assert!(
+            matches!(conn, Err(ConnectionBuilderError::WrongApplicationId(APP_ID)))
+        );
+    }
+
+    #[tokio::test]
+    async fn older_migrations_wont_work() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test-db1.app");
+
+        // open with 2 migrations:
+        let conn = ConnectionBuilder::new()
+            .add_migration(1, users_table)
+            .add_migration(2, data_table)
+            .open(&path)
+            .await
+            .unwrap();
+
+        drop(conn);
+
+        // open again with just one migration. This could happen
+        // if eg older software tries opening newer db.
+        let conn = ConnectionBuilder::new()
+            .add_migration(1, users_table)
+            .open(&path)
+            .await;
+
+        assert!(
+            matches!(conn, Err(ConnectionBuilderError::OutOfDate { db_version: 2, latest_migration: 1 }))
+        );
+    }
+
+    #[tokio::test]
+    async fn no_new_migrations_applied_if_one_is_broken() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test-db1.app");
+
+        // open with 1 valid migrations:
+        let conn = ConnectionBuilder::new()
+            .add_migration(1, users_table)
+            .open(&path)
+            .await
+            .unwrap();
+
+        drop(conn);
+
+        // open again with another 2 migrations, 1 valid
+        // and 1 broken.
+        let conn = ConnectionBuilder::new()
+            .add_migration(1, users_table)
+            .add_migration(2, data_table)
+            .add_migration(3, |conn| {
+                conn.execute("SOME GARBAGE", [])?;
+                Ok(())
+            })
+            .open(&path)
+            .await;
+
+        assert!(
+            matches!(conn, Err(ConnectionBuilderError::Migration(_)))
+        );
+
+        // if we open again, there should exist no data table
+        // and the app version should still be 1.
+        let conn = ConnectionBuilder::new()
+            .add_migration(1, users_table)
+            .open(&path)
+            .await
+            .unwrap();
+
+        let data_call = conn.call(|conn| {
+            conn.query_row("SELECT count(*) FROM data", [], |_| Ok(()))
+        }).await;
+        assert!(data_call.is_err());
+        assert_eq!(get_user_version(&conn).await, 1);
+    }
+}

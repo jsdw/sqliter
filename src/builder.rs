@@ -34,6 +34,10 @@ impl <E: Send + 'static> ConnectionBuilder<E> {
 
     /// Add a single migration to the list, which will be responsible for
     /// upgrading the database to the version given.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the migration version given is not greater than 0.
     pub fn add_migration<F>(mut self, version: i32, migration: F) -> Self
     where
         F: Send + 'static + Fn(&rusqlite::Connection) -> Result<(), E>

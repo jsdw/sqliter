@@ -1,3 +1,8 @@
+# 0.3.0
+
+- Panic if migration with version 0 or less given (it wouldn't work as hoped).
+- Add a bunch of tests.
+
 # 0.2.0
 
 - `Migrations` also now has a default error parameter.

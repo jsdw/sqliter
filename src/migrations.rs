@@ -27,9 +27,14 @@ impl <E> Migrations<E> {
     /// user_version is set in the DB to record the version we're up to.
     /// Migrations should never be removed or changed once they have been
     /// applied to a DB somewhere.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the migration version given is not greater than 0.
     pub fn add<F>(mut self, version: i32, migration: F) -> Self
     where F: Fn(&rusqlite::Connection) -> Result<(), E> + Send + 'static
     {
+        assert!(version > 0, "migration version must be greater than 0");
         let migration = Box::new(migration);
         self.migrations.push(Reverse(Migration { version, migration }));
         self
