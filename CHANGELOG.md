@@ -1,3 +1,7 @@
+# 0.4.0
+
+- Allow `on_close` handler to be attached when constructing our database connection.
+
 # 0.3.0
 
 - Panic if migration with version 0 or less given (it wouldn't work as hoped).

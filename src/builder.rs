@@ -12,6 +12,8 @@ pub struct ConnectionBuilder<E = rusqlite::Error> {
     app_id: i32,
     // Migrations to apply
     migrations: Migrations<E>,
+    // Function to call when the db thread shuts down
+    on_close: Option<Box<dyn FnOnce(Option<rusqlite::Connection>) + Send + 'static>>
 }
 
 impl <E: Send + 'static> ConnectionBuilder<E> {
@@ -19,8 +21,17 @@ impl <E: Send + 'static> ConnectionBuilder<E> {
     pub fn new() -> Self {
         Self {
             app_id: 0,
-            migrations: Default::default()
+            migrations: Default::default(),
+            on_close: None,
         }
+    }
+
+    /// Configure a function to be called exactly once when the connection is closed.
+    /// If the database has already been closed then it will be given `None`, else it
+    /// will be handed the database connection.
+    pub fn on_close<F: FnOnce(Option<rusqlite::Connection>) + Send + 'static>(mut self, f: F) -> Self {
+        self.on_close = Some(Box::new(f));
+        self
     }
 
     /// Set the "app ID" for this database. If opening an existing file,
@@ -55,14 +66,14 @@ impl <E: Send + 'static> ConnectionBuilder<E> {
     }
 
     /// Open a connection to an in-memory database.
-    pub async fn open_in_memory(self) -> Result<Connection, ConnectionBuilderError<E>> {
-        let mut conn = Connection::open_in_memory().await?;
+    pub async fn open_in_memory(mut self) -> Result<Connection, ConnectionBuilderError<E>> {
+        let mut conn = self.connection_builder().open_in_memory().await?;
         self.setup(&mut conn, true).await?;
         Ok(conn)
     }
 
     /// Open a connection to a database at some file.
-    pub async fn open<P: AsRef<Path>>(self, path: P) -> Result<Connection, ConnectionBuilderError<E>> {
+    pub async fn open<P: AsRef<Path>>(mut self, path: P) -> Result<Connection, ConnectionBuilderError<E>> {
         use async_rusqlite::rusqlite::{
             OpenFlags, Error::SqliteFailure, ffi::ErrorCode::CannotOpen, ffi
         };
@@ -75,13 +86,13 @@ impl <E: Send + 'static> ConnectionBuilder<E> {
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
 
-        let (conn, is_new) = match Connection::open_with_flags(path.as_ref(), flags).await {
+        let (conn, is_new) = match self.connection_builder().open_with_flags(path.as_ref(), flags).await {
             // All good:
             Ok(conn) => (conn, false),
             // Can't open the file; try again but allow creating it:
             Err(SqliteFailure(ffi::Error { code, .. }, _)) if code == CannotOpen => {
                 let flags = flags | OpenFlags::SQLITE_OPEN_CREATE;
-                let conn = Connection::open_with_flags(path, flags).await?;
+                let conn = self.connection_builder().open_with_flags(path, flags).await?;
                 (conn, true)
             },
             // Something else went wrong; just return the error.
@@ -90,6 +101,17 @@ impl <E: Send + 'static> ConnectionBuilder<E> {
 
         self.setup(&conn, is_new).await?;
         Ok(conn)
+    }
+
+    // A connection builder.
+    fn connection_builder(&mut self) -> async_rusqlite::ConnectionBuilder {
+        let mut builder = Connection::builder();
+
+        if let Some(on_close) = self.on_close.take() {
+            builder = builder.on_close(on_close);
+        }
+
+        builder
     }
 
     // Perform any setup on the opened connection.
