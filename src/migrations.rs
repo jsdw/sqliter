@@ -31,24 +31,48 @@ impl <E> Migrations<E> {
     /// # Panics
     ///
     /// Panics if the migration version given is not greater than 0.
-    pub fn add<F>(mut self, version: i32, migration: F) -> Self
+    pub fn add<F>(self, version: i32, migration: F) -> Self
+    where F: Fn(&rusqlite::Connection) -> Result<(), E> + Send + 'static
+    {
+        self.do_add_migration(version, true, migration)
+    }
+
+    /// Like [`Migrations::add()`], except the migration will _not_ be performed
+    /// inside a transaction. **This can lead to an invalid database state; use
+    /// with extreme caution**.
+    ///
+    /// The expected use case for this is that it will internally begin a transaction,
+    /// but may choose to do things like disabling foreign keys first, which cannot
+    /// be done inside a transaction.
+    pub fn add_non_transactionally<F>(self, version: i32, migration: F) -> Self
+    where F: Fn(&rusqlite::Connection) -> Result<(), E> + Send + 'static
+    {
+        self.do_add_migration(version, false, migration)
+    }
+
+    fn do_add_migration<F>(mut self, version: i32, perform_in_transaction: bool, migration: F) -> Self
     where F: Fn(&rusqlite::Connection) -> Result<(), E> + Send + 'static
     {
         assert!(version > 0, "migration version must be greater than 0");
         let migration = Box::new(migration);
-        self.migrations.push(Reverse(Migration { version, migration }));
+        self.migrations.push(Reverse(Migration {
+            version,
+            perform_in_transaction,
+            migration
+        }));
         self
     }
 
     /// Iterate over the migrations, lowest to highest version.
-    pub fn iter(&self) -> impl Iterator<Item = (i32, &MigrationFn<E>)> {
-        self.migrations.iter().map(|Reverse(m)| (m.version, &*m.migration))
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (i32, bool, &MigrationFn<E>)> {
+        self.migrations.iter().map(|Reverse(m)| (m.version, m.perform_in_transaction, &*m.migration))
     }
 }
 
 /// Migrations are ordered by their version.
 struct Migration<E> {
     version: i32,
+    perform_in_transaction: bool,
     migration: Box<MigrationFn<E>>
 }
 

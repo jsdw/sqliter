@@ -93,10 +93,15 @@ mod test {
         }).await.unwrap()
     }
 
+    fn get_user_version_rusqlite(conn: &rusqlite::Connection) -> i32 {
+        conn.pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("user_version expected")
+    }
+
     async fn get_user_version(conn: &Connection) -> i32 {
         conn.call(|conn| {
-            conn.pragma_query_value(None, "user_version", |row| row.get(0))
-        }).await.expect("user_version expected")
+            Ok::<_, rusqlite::Error>(get_user_version_rusqlite(conn))
+        }).await.unwrap()
     }
 
     #[tokio::test]
@@ -232,7 +237,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn no_new_migrations_applied_if_one_is_broken() {
+    async fn migrations_applied_up_to_broken_one() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("test-db1.app");
 
@@ -261,10 +266,14 @@ mod test {
             matches!(conn, Err(ConnectionBuilderError::Migration(_)))
         );
 
-        // if we open again, there should exist no data table
-        // and the app version should still be 1.
+        // Check that user version was set to 2:
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(get_user_version_rusqlite(&conn), 2);
+
+        // Opening db with valid migrations set should be fine:
         let conn = ConnectionBuilder::new()
             .add_migration(1, users_table)
+            .add_migration(2, data_table)
             .open(&path)
             .await
             .unwrap();
@@ -272,7 +281,36 @@ mod test {
         let data_call = conn.call(|conn| {
             conn.query_row("SELECT count(*) FROM data", [], |_| Ok(()))
         }).await;
-        assert!(data_call.is_err());
-        assert_eq!(get_user_version(&conn).await, 1);
+        assert!(data_call.is_ok());
+    }
+
+    #[tokio::test]
+    async fn non_transactional_migration_can_be_applied() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test-db1.app");
+
+        let conn = ConnectionBuilder::new()
+            .add_migration_non_transactionally(1, |conn| {
+                // Deliberately error after adding some bits to the db:
+                users_table(conn).expect("should work");
+                Err(rusqlite::Error::InvalidQuery)
+            })
+            .open(&path)
+            .await;
+
+        assert!(
+            matches!(conn, Err(ConnectionBuilderError::Migration(_)))
+        );
+
+        // Check that user version was not updated:
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(get_user_version_rusqlite(&conn), 0);
+
+        // But, users table should be accessible and contain what the failed migration
+        // added, since it wasn't in a transaction and thus wasnt rolled back.
+        let name: String = conn
+            .query_row("SELECT name FROM users WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(name, "James");
     }
 }

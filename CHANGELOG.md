@@ -1,3 +1,7 @@
+# 0.5.0
+
+- Allow non-transactional migrations to be performed via `Migrations::add_non_transactionally()`.
+
 # 0.4.0
 
 - Allow `on_close` handler to be attached when constructing our database connection.

@@ -16,6 +16,12 @@ pub struct ConnectionBuilder<E = rusqlite::Error> {
     on_close: Option<Box<dyn FnOnce(Option<rusqlite::Connection>) + Send + 'static>>
 }
 
+impl <E: Send + 'static> Default for ConnectionBuilder<E> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl <E: Send + 'static> ConnectionBuilder<E> {
     /// Construct a new connection builder.
     pub fn new() -> Self {
@@ -57,6 +63,19 @@ impl <E: Send + 'static> ConnectionBuilder<E> {
         self
     }
 
+    /// **Warning: using this could lead to database state being invalid.**
+    ///
+    /// Add a single migration to the list. The migration will not be performed
+    /// inside a transaction. Use [`Self::add_migration`] unless you know what
+    /// you are doing.
+    pub fn add_migration_non_transactionally<F>(mut self, version: i32, migration: F) -> Self
+    where
+        F: Send + 'static + Fn(&rusqlite::Connection) -> Result<(), E>
+    {
+        self.migrations = self.migrations.add_non_transactionally(version, migration);
+        self
+    }
+
     /// Use the provided set of migrations to ensure that the database we connect
     /// to is uptodate. This uses the `user_version` PRAGMA to know which migrations
     /// to apply.
@@ -67,8 +86,8 @@ impl <E: Send + 'static> ConnectionBuilder<E> {
 
     /// Open a connection to an in-memory database.
     pub async fn open_in_memory(mut self) -> Result<Connection, ConnectionBuilderError<E>> {
-        let mut conn = self.connection_builder().open_in_memory().await?;
-        self.setup(&mut conn, true).await?;
+        let conn = self.connection_builder().open_in_memory().await?;
+        self.setup(&conn, true).await?;
         Ok(conn)
     }
 
@@ -142,31 +161,38 @@ impl <E: Send + 'static> ConnectionBuilder<E> {
                 |row| row.get(0)
             )?;
 
-            // Attempt all migrations, doing none on failure. Main reason for this is
-            // to update the user_version PRAGMA on success and ensure that either everything
-            // inc that version is in sync always.
-            let transaction = conn.transaction()?;
-
+            // Attempt each migration atomically. If a migration fails, we don't
+            // want the DB to have been altered.
             let mut latest_migration_version = 0;
-            for (version, migration) in self.migrations.iter() {
+            for (version, perform_in_transaction, migration) in self.migrations.iter() {
                 latest_migration_version = version;
                 if version > user_version {
-                    migration(&*transaction).map_err(ConnectionBuilderError::Migration)?;
+                    if perform_in_transaction {
+                        // in one transaction, apply a migration and update the db version
+                        // to reflect this. nothing happens on failure; transaction rolled back.
+                        let transaction = conn.transaction()?;
+                        migration(&transaction).map_err(ConnectionBuilderError::Migration)?;
+                        transaction.pragma_update(None, "user_version", version)?;
+                        transaction.commit()?;
+                    } else {
+                        // This is less safe, since any failure inside the migration can lead to
+                        // the database being in an invalid state. Sometimes though, we need to
+                        // control the transaction behaviour inside the migration, so this is
+                        // the best we can do.
+                        migration(conn).map_err(ConnectionBuilderError::Migration)?;
+                        conn.pragma_update(None, "user_version", version)?;
+                    }
                 }
             }
 
-            if latest_migration_version > user_version {
-                // Some migrations happened; update user version and commit transaction.
-                transaction.pragma_update(None, "user_version", latest_migration_version)?;
-                transaction.commit()?;
-            } else if latest_migration_version < user_version {
+            if latest_migration_version < user_version {
                 // We don't have migrations up to the version that the db is at already.
                 // This probably means that this app is out of date. Complain, to prevent
                 // an out of date app from trying to use the newer database.
                 return Err(ConnectionBuilderError::OutOfDate {
                     db_version: user_version,
                     latest_migration: latest_migration_version
-                }.into())
+                })
             }
 
             Ok(())
