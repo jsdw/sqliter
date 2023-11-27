@@ -1,3 +1,7 @@
+# 0.5.1
+
+- Move tempfile dependency to dev dependencies (not sure when/how it ended up as an actual one!)
+
 # 0.5.0
 
 - Allow non-transactional migrations to be performed via `Migrations::add_non_transactionally()`.
