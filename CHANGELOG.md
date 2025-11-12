@@ -1,3 +1,7 @@
+# 0.6.0
+
+- Update to `async-rusqlite` 0.5.0 (and rusqlite 0.37.0 as a result).
+
 # 0.5.1
 
 - Move tempfile dependency to dev dependencies (not sure when/how it ended up as an actual one!)
