@@ -1,24 +1,24 @@
-use std::collections::BinaryHeap;
 use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 
 type MigrationFn<E> = dyn Send + 'static + Fn(&rusqlite::Connection) -> Result<(), E>;
 
 /// Define a set of migrations to apply to an SQLite connection.
 pub struct Migrations<E = rusqlite::Error> {
-    migrations: BinaryHeap<Reverse<Migration<E>>>
+    migrations: BinaryHeap<Reverse<Migration<E>>>,
 }
 
-impl <E> Default for Migrations<E> {
+impl<E> Default for Migrations<E> {
     fn default() -> Self {
         Migrations::new()
     }
 }
 
-impl <E> Migrations<E> {
+impl<E> Migrations<E> {
     /// Construct a new set of migrations,
     pub fn new() -> Self {
         Migrations {
-            migrations: Default::default()
+            migrations: Default::default(),
         }
     }
 
@@ -32,7 +32,8 @@ impl <E> Migrations<E> {
     ///
     /// Panics if the migration version given is not greater than 0.
     pub fn add<F>(self, version: i32, migration: F) -> Self
-    where F: Fn(&rusqlite::Connection) -> Result<(), E> + Send + 'static
+    where
+        F: Fn(&rusqlite::Connection) -> Result<(), E> + Send + 'static,
     {
         self.do_add_migration(version, true, migration)
     }
@@ -45,27 +46,36 @@ impl <E> Migrations<E> {
     /// but may choose to do things like disabling foreign keys first, which cannot
     /// be done inside a transaction.
     pub fn add_non_transactionally<F>(self, version: i32, migration: F) -> Self
-    where F: Fn(&rusqlite::Connection) -> Result<(), E> + Send + 'static
+    where
+        F: Fn(&rusqlite::Connection) -> Result<(), E> + Send + 'static,
     {
         self.do_add_migration(version, false, migration)
     }
 
-    fn do_add_migration<F>(mut self, version: i32, perform_in_transaction: bool, migration: F) -> Self
-    where F: Fn(&rusqlite::Connection) -> Result<(), E> + Send + 'static
+    fn do_add_migration<F>(
+        mut self,
+        version: i32,
+        perform_in_transaction: bool,
+        migration: F,
+    ) -> Self
+    where
+        F: Fn(&rusqlite::Connection) -> Result<(), E> + Send + 'static,
     {
         assert!(version > 0, "migration version must be greater than 0");
         let migration = Box::new(migration);
         self.migrations.push(Reverse(Migration {
             version,
             perform_in_transaction,
-            migration
+            migration,
         }));
         self
     }
 
     /// Iterate over the migrations, lowest to highest version.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (i32, bool, &MigrationFn<E>)> {
-        self.migrations.iter().map(|Reverse(m)| (m.version, m.perform_in_transaction, &*m.migration))
+        self.migrations
+            .iter()
+            .map(|Reverse(m)| (m.version, m.perform_in_transaction, &*m.migration))
     }
 }
 
@@ -73,25 +83,25 @@ impl <E> Migrations<E> {
 struct Migration<E> {
     version: i32,
     perform_in_transaction: bool,
-    migration: Box<MigrationFn<E>>
+    migration: Box<MigrationFn<E>>,
 }
 
-impl <E> PartialEq for Migration<E> {
+impl<E> PartialEq for Migration<E> {
     fn eq(&self, other: &Self) -> bool {
         self.version == other.version
     }
 }
 
-impl <E> Eq for Migration<E> {}
+impl<E> Eq for Migration<E> {}
 
-impl <E> Ord for Migration<E> {
+impl<E> Ord for Migration<E> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.version.cmp(&other.version)
     }
 }
 
-impl <E> PartialOrd for Migration<E> {
+impl<E> PartialOrd for Migration<E> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.version.partial_cmp(&other.version)
+        Some(self.cmp(other))
     }
 }

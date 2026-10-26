@@ -1,8 +1,8 @@
+use async_rusqlite::Connection;
 use std::path::Path;
-use async_rusqlite::{Connection};
 
-use crate::migrations::Migrations;
 use crate::error::ConnectionBuilderError;
+use crate::migrations::Migrations;
 
 /// An opinionated connection builder which ultimately hands back
 /// an [`async_rusqlite::Connection`] after checking the app ID and
@@ -13,16 +13,16 @@ pub struct ConnectionBuilder<E = rusqlite::Error> {
     // Migrations to apply
     migrations: Migrations<E>,
     // Function to call when the db thread shuts down
-    on_close: Option<Box<dyn FnOnce(Option<rusqlite::Connection>) + Send + 'static>>
+    on_close: Option<Box<dyn FnOnce(Option<rusqlite::Connection>) + Send + 'static>>,
 }
 
-impl <E: Send + 'static> Default for ConnectionBuilder<E> {
+impl<E: Send + 'static> Default for ConnectionBuilder<E> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl <E: Send + 'static> ConnectionBuilder<E> {
+impl<E: Send + 'static> ConnectionBuilder<E> {
     /// Construct a new connection builder.
     pub fn new() -> Self {
         Self {
@@ -35,7 +35,10 @@ impl <E: Send + 'static> ConnectionBuilder<E> {
     /// Configure a function to be called exactly once when the connection is closed.
     /// If the database has already been closed then it will be given `None`, else it
     /// will be handed the database connection.
-    pub fn on_close<F: FnOnce(Option<rusqlite::Connection>) + Send + 'static>(mut self, f: F) -> Self {
+    pub fn on_close<F: FnOnce(Option<rusqlite::Connection>) + Send + 'static>(
+        mut self,
+        f: F,
+    ) -> Self {
         self.on_close = Some(Box::new(f));
         self
     }
@@ -57,7 +60,7 @@ impl <E: Send + 'static> ConnectionBuilder<E> {
     /// Panics if the migration version given is not greater than 0.
     pub fn add_migration<F>(mut self, version: i32, migration: F) -> Self
     where
-        F: Send + 'static + Fn(&rusqlite::Connection) -> Result<(), E>
+        F: Send + 'static + Fn(&rusqlite::Connection) -> Result<(), E>,
     {
         self.migrations = self.migrations.add(version, migration);
         self
@@ -70,7 +73,7 @@ impl <E: Send + 'static> ConnectionBuilder<E> {
     /// you are doing.
     pub fn add_migration_non_transactionally<F>(mut self, version: i32, migration: F) -> Self
     where
-        F: Send + 'static + Fn(&rusqlite::Connection) -> Result<(), E>
+        F: Send + 'static + Fn(&rusqlite::Connection) -> Result<(), E>,
     {
         self.migrations = self.migrations.add_non_transactionally(version, migration);
         self
@@ -92,28 +95,42 @@ impl <E: Send + 'static> ConnectionBuilder<E> {
     }
 
     /// Open a connection to a database at some file.
-    pub async fn open<P: AsRef<Path>>(mut self, path: P) -> Result<Connection, ConnectionBuilderError<E>> {
+    pub async fn open<P: AsRef<Path>>(
+        mut self,
+        path: P,
+    ) -> Result<Connection, ConnectionBuilderError<E>> {
         use async_rusqlite::rusqlite::{
-            OpenFlags, Error::SqliteFailure, ffi::ErrorCode::CannotOpen, ffi
+            Error::SqliteFailure, OpenFlags, ffi, ffi::ErrorCode::CannotOpen,
         };
 
         // The default flags rusqlite's open fn uses. First we try opening
         // and disallow creating a new DB. Then we allow creating a new DB.
         // This allows us to know when a new DB was created and act accordingly.
-        let flags
-            = OpenFlags::SQLITE_OPEN_READ_WRITE
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
 
-        let (conn, is_new) = match self.connection_builder().open_with_flags(path.as_ref(), flags).await {
+        let (conn, is_new) = match self
+            .connection_builder()
+            .open_with_flags(path.as_ref(), flags)
+            .await
+        {
             // All good:
             Ok(conn) => (conn, false),
             // Can't open the file; try again but allow creating it:
-            Err(SqliteFailure(ffi::Error { code, .. }, _)) if code == CannotOpen => {
+            Err(SqliteFailure(
+                ffi::Error {
+                    code: CannotOpen, ..
+                },
+                _,
+            )) => {
                 let flags = flags | OpenFlags::SQLITE_OPEN_CREATE;
-                let conn = self.connection_builder().open_with_flags(path, flags).await?;
+                let conn = self
+                    .connection_builder()
+                    .open_with_flags(path, flags)
+                    .await?;
                 (conn, true)
-            },
+            }
             // Something else went wrong; just return the error.
             Err(e) => return Err(e.into()),
         };
@@ -141,13 +158,10 @@ impl <E: Send + 'static> ConnectionBuilder<E> {
                 conn.pragma_update(None, "application_id", self.app_id)?;
             } else {
                 // Check the app ID if this is not a new DB.
-                let val: i32 = conn.query_row(
-                    "SELECT * from pragma_application_id",
-                    [],
-                    |row| row.get(0)
-                )?;
+                let val: i32 =
+                    conn.query_row("SELECT * from pragma_application_id", [], |row| row.get(0))?;
                 if val != self.app_id {
-                    return Err(ConnectionBuilderError::WrongApplicationId(val))
+                    return Err(ConnectionBuilderError::WrongApplicationId(val));
                 }
             }
 
@@ -155,11 +169,8 @@ impl <E: Send + 'static> ConnectionBuilder<E> {
             conn.pragma_update(None, "foreign_keys", true)?;
 
             // Which version is the DB at (ie do we need to run any migrations)
-            let user_version: i32 = conn.query_row(
-                "SELECT * FROM pragma_user_version",
-                [],
-                |row| row.get(0)
-            )?;
+            let user_version: i32 =
+                conn.query_row("SELECT * FROM pragma_user_version", [], |row| row.get(0))?;
 
             // Attempt each migration atomically. If a migration fails, we don't
             // want the DB to have been altered.
@@ -191,11 +202,12 @@ impl <E: Send + 'static> ConnectionBuilder<E> {
                 // an out of date app from trying to use the newer database.
                 return Err(ConnectionBuilderError::OutOfDate {
                     db_version: user_version,
-                    latest_migration: latest_migration_version
-                })
+                    latest_migration: latest_migration_version,
+                });
             }
 
             Ok(())
-        }).await
+        })
+        .await
     }
 }

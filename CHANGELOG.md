@@ -1,3 +1,8 @@
+# 0.7.0
+
+- Update to `async-rusqlite` 0.6.0 (and rusqlite 0.41.0 as a result).
+- Update to Rust 2024 edition; MSRV is now 1.89.
+
 # 0.6.0
 
 - Update to `async-rusqlite` 0.5.0 (and rusqlite 0.37.0 as a result).

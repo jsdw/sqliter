@@ -41,6 +41,11 @@
 //! # }
 //! ```
 
+// Ensure that the README example compiles and runs.
+#[doc = include_str!("../README.md")]
+#[cfg(doctest)]
+pub struct ReadmeDoctests;
+
 mod builder;
 mod error;
 mod migrations;
@@ -50,14 +55,15 @@ pub use error::ConnectionBuilderError;
 pub use migrations::Migrations;
 
 // Export these since we are just a thin wrapper around them.
-pub use async_rusqlite::{ self, rusqlite, Connection };
+pub use async_rusqlite::{self, Connection, rusqlite};
 
 #[cfg(test)]
 mod test {
     use super::*;
 
     fn users_table(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
-        conn.execute_batch("
+        conn.execute_batch(
+            "
             CREATE TABLE users (
                 id INTEGER PRIMARY KEY NOT NULL,
                 name TEXT NOT NULL
@@ -71,7 +77,8 @@ mod test {
     }
 
     fn data_table(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
-        conn.execute_batch("
+        conn.execute_batch(
+            "
             CREATE TABLE data (
                 owner INTEGER NOT NULL,
                 text TEXT NOT NULL,
@@ -80,17 +87,16 @@ mod test {
             ) STRICT;
 
             INSERT INTO data VALUES (1, 'James data');
-        ")
+        ",
+        )
     }
 
     async fn get_app_id(conn: &Connection) -> i32 {
         conn.call(|conn| {
-            conn.query_row(
-                "SELECT * from pragma_application_id",
-                [],
-                |row| row.get(0)
-            )
-        }).await.unwrap()
+            conn.query_row("SELECT * from pragma_application_id", [], |row| row.get(0))
+        })
+        .await
+        .unwrap()
     }
 
     fn get_user_version_rusqlite(conn: &rusqlite::Connection) -> i32 {
@@ -99,9 +105,9 @@ mod test {
     }
 
     async fn get_user_version(conn: &Connection) -> i32 {
-        conn.call(|conn| {
-            Ok::<_, rusqlite::Error>(get_user_version_rusqlite(conn))
-        }).await.unwrap()
+        conn.call(|conn| Ok::<_, rusqlite::Error>(get_user_version_rusqlite(conn)))
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -126,9 +132,12 @@ mod test {
         assert_eq!(get_user_version(&conn).await, 7);
 
         // table should be accessible and contain what the migration added:
-        let name: String = conn.call(|conn| {
-            conn.query_row("SELECT name FROM users WHERE id = 1", [], |row| row.get(0))
-        }).await.unwrap();
+        let name: String = conn
+            .call(|conn| {
+                conn.query_row("SELECT name FROM users WHERE id = 1", [], |row| row.get(0))
+            })
+            .await
+            .unwrap();
         assert_eq!(name, "James");
     }
 
@@ -158,12 +167,19 @@ mod test {
         assert_eq!(get_user_version(&conn).await, 2);
 
         // Ensure both migrations applied:
-        let id: i32 = conn.call(|conn| {
-            conn.query_row("
+        let id: i32 = conn
+            .call(|conn| {
+                conn.query_row(
+                    "
                 SELECT users.id FROM data JOIN users ON data.owner = users.id
                 WHERE data.text = 'James data';
-            ", [], |row| row.get(0))
-        }).await.unwrap();
+            ",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap();
         assert_eq!(id, 1);
     }
 
@@ -204,9 +220,10 @@ mod test {
             .open(&path)
             .await;
 
-        assert!(
-            matches!(conn, Err(ConnectionBuilderError::WrongApplicationId(APP_ID)))
-        );
+        assert!(matches!(
+            conn,
+            Err(ConnectionBuilderError::WrongApplicationId(APP_ID))
+        ));
     }
 
     #[tokio::test]
@@ -231,9 +248,13 @@ mod test {
             .open(&path)
             .await;
 
-        assert!(
-            matches!(conn, Err(ConnectionBuilderError::OutOfDate { db_version: 2, latest_migration: 1 }))
-        );
+        assert!(matches!(
+            conn,
+            Err(ConnectionBuilderError::OutOfDate {
+                db_version: 2,
+                latest_migration: 1
+            })
+        ));
     }
 
     #[tokio::test]
@@ -262,9 +283,7 @@ mod test {
             .open(&path)
             .await;
 
-        assert!(
-            matches!(conn, Err(ConnectionBuilderError::Migration(_)))
-        );
+        assert!(matches!(conn, Err(ConnectionBuilderError::Migration(_))));
 
         // Check that user version was set to 2:
         let conn = rusqlite::Connection::open(&path).unwrap();
@@ -278,9 +297,9 @@ mod test {
             .await
             .unwrap();
 
-        let data_call = conn.call(|conn| {
-            conn.query_row("SELECT count(*) FROM data", [], |_| Ok(()))
-        }).await;
+        let data_call = conn
+            .call(|conn| conn.query_row("SELECT count(*) FROM data", [], |_| Ok(())))
+            .await;
         assert!(data_call.is_ok());
     }
 
@@ -298,9 +317,7 @@ mod test {
             .open(&path)
             .await;
 
-        assert!(
-            matches!(conn, Err(ConnectionBuilderError::Migration(_)))
-        );
+        assert!(matches!(conn, Err(ConnectionBuilderError::Migration(_))));
 
         // Check that user version was not updated:
         let conn = rusqlite::Connection::open(&path).unwrap();
