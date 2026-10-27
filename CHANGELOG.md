@@ -4,6 +4,8 @@
   - `ConnectionBuilder::open` and `ConnectionBuilder::open_in_memory` are renamed to `ConnectionBuilder::database` and `ConnectionBuilder::in_memory`, and now return a `ConnectionPendingMigrations`.
   - `ConnectionPendingMigrations::open()` performs any necessary migrations (and sets the app ID on a new database) before returning the `Connection`. Dropping the `ConnectionPendingMigrations` instead leaves the database unmodified.
   - `ConnectionPendingMigrations::needs_migrations()` and `ConnectionPendingMigrations::is_out_of_date()` can be used to inspect the database before deciding what to do.
+- Fix migrations sometimes being applied out of order when they were not added in ascending version order.
+- **Breaking:** Adding a migration with the same version as an existing one now panics.
 - **Breaking:** `ConnectionBuilderError` is replaced by `ConnectionError` (opening the database) and `MigrationsError` (performing migrations). Both convert into the new overarching `Error` type.
 
 # 0.7.0

@@ -1,11 +1,11 @@
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::BTreeMap;
 
 type MigrationFn<E> = dyn Send + 'static + Fn(&rusqlite::Connection) -> Result<(), E>;
 
 /// Define a set of migrations to apply to an SQLite connection.
 pub struct Migrations<E = rusqlite::Error> {
-    migrations: BinaryHeap<Reverse<Migration<E>>>,
+    // Migrations keyed by their version, so that they are ordered.
+    migrations: BTreeMap<i32, Migration<E>>,
 }
 
 impl<E> Default for Migrations<E> {
@@ -30,7 +30,8 @@ impl<E> Migrations<E> {
     ///
     /// # Panics
     ///
-    /// Panics if the migration version given is not greater than 0.
+    /// Panics if the migration version given is not greater than 0, or if
+    /// a migration with the same version has already been added.
     pub fn add<F>(self, version: i32, migration: F) -> Self
     where
         F: Fn(&rusqlite::Connection) -> Result<(), E> + Send + 'static,
@@ -45,6 +46,11 @@ impl<E> Migrations<E> {
     /// The expected use case for this is that it will internally begin a transaction,
     /// but may choose to do things like disabling foreign keys first, which cannot
     /// be done inside a transaction.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the migration version given is not greater than 0, or if
+    /// a migration with the same version has already been added.
     pub fn add_non_transactionally<F>(self, version: i32, migration: F) -> Self
     where
         F: Fn(&rusqlite::Connection) -> Result<(), E> + Send + 'static,
@@ -62,12 +68,18 @@ impl<E> Migrations<E> {
         F: Fn(&rusqlite::Connection) -> Result<(), E> + Send + 'static,
     {
         assert!(version > 0, "migration version must be greater than 0");
+        assert!(
+            !self.migrations.contains_key(&version),
+            "migration version {version} has already been added"
+        );
         let migration = Box::new(migration);
-        self.migrations.push(Reverse(Migration {
+        self.migrations.insert(
             version,
-            perform_in_transaction,
-            migration,
-        }));
+            Migration {
+                perform_in_transaction,
+                migration,
+            },
+        );
         self
     }
 
@@ -75,33 +87,11 @@ impl<E> Migrations<E> {
     pub(crate) fn iter(&self) -> impl Iterator<Item = (i32, bool, &MigrationFn<E>)> {
         self.migrations
             .iter()
-            .map(|Reverse(m)| (m.version, m.perform_in_transaction, &*m.migration))
+            .map(|(&version, m)| (version, m.perform_in_transaction, &*m.migration))
     }
 }
 
-/// Migrations are ordered by their version.
 struct Migration<E> {
-    version: i32,
     perform_in_transaction: bool,
     migration: Box<MigrationFn<E>>,
-}
-
-impl<E> PartialEq for Migration<E> {
-    fn eq(&self, other: &Self) -> bool {
-        self.version == other.version
-    }
-}
-
-impl<E> Eq for Migration<E> {}
-
-impl<E> Ord for Migration<E> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.version.cmp(&other.version)
-    }
-}
-
-impl<E> PartialOrd for Migration<E> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
 }

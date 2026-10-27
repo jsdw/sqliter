@@ -59,7 +59,8 @@ impl<E: Send + 'static> ConnectionBuilder<E> {
     ///
     /// # Panics
     ///
-    /// Panics if the migration version given is not greater than 0.
+    /// Panics if the migration version given is not greater than 0, or if
+    /// a migration with the same version has already been added.
     pub fn add_migration<F>(mut self, version: i32, migration: F) -> Self
     where
         F: Send + 'static + Fn(&rusqlite::Connection) -> Result<(), E>,
@@ -73,6 +74,11 @@ impl<E: Send + 'static> ConnectionBuilder<E> {
     /// Add a single migration to the list. The migration will not be performed
     /// inside a transaction. Use [`Self::add_migration`] unless you know what
     /// you are doing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the migration version given is not greater than 0, or if
+    /// a migration with the same version has already been added.
     pub fn add_migration_non_transactionally<F>(mut self, version: i32, migration: F) -> Self
     where
         F: Send + 'static + Fn(&rusqlite::Connection) -> Result<(), E>,

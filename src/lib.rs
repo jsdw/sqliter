@@ -130,6 +130,15 @@ mod test {
             .unwrap();
     }
 
+    #[test]
+    #[should_panic(expected = "migration version 2 has already been added")]
+    fn duplicate_migration_version() {
+        ConnectionBuilder::new()
+            .add_migration(1, users_table)
+            .add_migration(2, data_table)
+            .add_migration_non_transactionally(2, data_table);
+    }
+
     #[tokio::test]
     async fn migration_is_applied() {
         let conn = ConnectionBuilder::new()
@@ -152,6 +161,30 @@ mod test {
             .await
             .unwrap();
         assert_eq!(name, "James");
+    }
+
+    #[tokio::test]
+    async fn migrations_applied_in_version_order() {
+        use std::sync::{Arc, Mutex};
+
+        // Record the order that migrations are applied in:
+        let applied = Arc::new(Mutex::new(Vec::new()));
+
+        // Add migrations out of order:
+        let mut builder = ConnectionBuilder::<rusqlite::Error>::new();
+        for version in [3, 5, 1, 4, 2] {
+            let applied = applied.clone();
+            builder = builder.add_migration(version, move |_conn| {
+                applied.lock().unwrap().push(version);
+                Ok(())
+            });
+        }
+
+        let conn = builder.in_memory().await.unwrap().open().await.unwrap();
+
+        // Migrations should be applied lowest to highest version:
+        assert_eq!(*applied.lock().unwrap(), vec![1, 2, 3, 4, 5]);
+        assert_eq!(get_user_version(&conn).await, 5);
     }
 
     #[tokio::test]
