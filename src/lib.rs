@@ -33,7 +33,7 @@
 //!
 //!     // Migrations are not run until we ask for them. Here we could check
 //!     // `pending.needs_migrations()` and, for instance, back up the database
-//!     // first, or use `pending.open_without_migrations()` to avoid migrating.
+//!     // first, or drop `pending` to leave the database unmodified.
 //!     let conn = pending.open().await?;
 //!     Ok(conn)
 //! }
@@ -290,12 +290,16 @@ mod test {
     }
 
     #[tokio::test]
-    async fn migrations_only_run_when_asked() {
+    async fn database_unmodified_until_opened() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("test-db1.app");
 
-        // A new DB with migrations needs migrating, so can't be opened without them:
+        const APP_ID: i32 = 12345;
+        const DIFFERENT_APP_ID: i32 = 76543;
+
+        // A new DB with migrations needs migrating:
         let pending = ConnectionBuilder::new()
+            .app_id(APP_ID)
             .add_migration(1, users_table)
             .database(&path)
             .await
@@ -303,15 +307,20 @@ mod test {
 
         assert!(pending.needs_migrations());
         assert!(!pending.is_out_of_date());
-        assert!(pending.open_without_migrations().is_none());
+        drop(pending);
 
-        // Nothing should have been migrated:
+        // Nothing should have been migrated, and the app ID should not be set:
         let conn = rusqlite::Connection::open(&path).unwrap();
         assert_eq!(get_user_version_rusqlite(&conn), 0);
+        let app_id: i32 = conn
+            .query_row("SELECT * from pragma_application_id", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(app_id, 0);
         drop(conn);
 
-        // Now migrate the DB:
+        // So the DB is still new, and can be opened with a different app ID:
         let conn = ConnectionBuilder::new()
+            .app_id(DIFFERENT_APP_ID)
             .add_migration(1, users_table)
             .database(&path)
             .await
@@ -320,26 +329,28 @@ mod test {
             .await
             .unwrap();
 
+        assert_eq!(get_app_id(&conn).await, DIFFERENT_APP_ID);
         assert_eq!(get_user_version(&conn).await, 1);
         drop(conn);
 
-        // Once migrated, we can open without migrations:
+        // Once migrated, no further migrations are needed:
         let pending = ConnectionBuilder::new()
+            .app_id(DIFFERENT_APP_ID)
             .add_migration(1, users_table)
             .database(&path)
             .await
             .unwrap();
 
         assert!(!pending.needs_migrations());
-        let conn = pending
-            .open_without_migrations()
-            .expect("no migrations needed");
-        assert_eq!(get_user_version(&conn).await, 1);
+        assert!(!pending.is_out_of_date());
     }
 
     #[tokio::test]
-    async fn no_migrations_can_open_without_migrations() {
+    async fn app_id_set_without_migrations() {
+        const APP_ID: i32 = 12345;
+
         let pending = ConnectionBuilder::<rusqlite::Error>::new()
+            .app_id(APP_ID)
             .in_memory()
             .await
             .unwrap();
@@ -347,9 +358,8 @@ mod test {
         assert!(!pending.needs_migrations());
         assert!(!pending.is_out_of_date());
 
-        let conn = pending
-            .open_without_migrations()
-            .expect("no migrations needed");
+        let conn = pending.open().await.unwrap();
+        assert_eq!(get_app_id(&conn).await, APP_ID);
         assert_eq!(get_user_version(&conn).await, 0);
     }
 
@@ -443,5 +453,73 @@ mod test {
             .query_row("SELECT name FROM users WHERE id = 1", [], |row| row.get(0))
             .unwrap();
         assert_eq!(name, "James");
+    }
+
+    #[tokio::test]
+    async fn empty_database_file_is_treated_as_new() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test-db1.app");
+
+        const APP_ID: i32 = 12345;
+
+        // An existing but empty file:
+        std::fs::write(&path, b"").unwrap();
+
+        let conn = ConnectionBuilder::new()
+            .app_id(APP_ID)
+            .add_migration(1, users_table)
+            .database(&path)
+            .await
+            .expect("empty file should be treated as a new database")
+            .open()
+            .await
+            .unwrap();
+
+        assert_eq!(get_app_id(&conn).await, APP_ID);
+        assert_eq!(get_user_version(&conn).await, 1);
+    }
+
+    // Open the database at the given path with an `on_close` handler attached,
+    // close it, and return whether the handler was called with the connection.
+    async fn on_close_called_with_connection(path: &std::path::Path) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let conn = ConnectionBuilder::new()
+            .add_migration(1, users_table)
+            .on_close(move |db| {
+                let _ = tx.send(db.is_some());
+            })
+            .database(path)
+            .await
+            .unwrap()
+            .open()
+            .await
+            .unwrap();
+
+        drop(conn);
+
+        // If the handler is dropped without being called, this will
+        // error with `Disconnected` rather than waiting for the timeout.
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn on_close_called_for_existing_database() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test-db1.app");
+
+        // Create the database first:
+        rusqlite::Connection::open(&path).unwrap();
+
+        assert!(on_close_called_with_connection(&path).await);
+    }
+
+    #[tokio::test]
+    async fn on_close_called_for_new_database() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test-db1.app");
+
+        assert!(on_close_called_with_connection(&path).await);
     }
 }

@@ -5,9 +5,10 @@ use crate::MigrationsError;
 use crate::error::ConnectionError;
 use crate::migrations::Migrations;
 
-/// An opinionated connection builder which ultimately hands back
-/// an [`async_rusqlite::Connection`] after checking the app ID and
-/// performing any necessary migrations.
+/// An opinionated connection builder. Open an application database
+/// [from a file][ConnectionBuilder::database] or
+/// [in memory][ConnectionBuilder::in_memory] and run or check the migration
+/// status of it.
 pub struct ConnectionBuilder<E = rusqlite::Error> {
     // PRAGMA application_id = INTEGER; default 0
     app_id: i32,
@@ -90,18 +91,8 @@ impl<E: Send + 'static> ConnectionBuilder<E> {
 
     /// Prepare to open a connection to an in-memory database.
     pub async fn in_memory(mut self) -> Result<ConnectionPendingMigrations<E>, ConnectionError> {
-        let conn = self
-            .connection_builder()
-            .open_in_memory()
-            .await
-            .map_err(ConnectionError::Db)?;
-
-        let current_db_version = self.setup(&conn, true).await?;
-        Ok(ConnectionPendingMigrations::new(
-            conn,
-            self.migrations,
-            current_db_version,
-        ))
+        let conn = self.connection_builder().open_in_memory().await?;
+        self.setup(conn).await
     }
 
     /// Prepare to open a connection to a database file at some path.
@@ -109,49 +100,13 @@ impl<E: Send + 'static> ConnectionBuilder<E> {
         mut self,
         path: P,
     ) -> Result<ConnectionPendingMigrations<E>, ConnectionError> {
-        use async_rusqlite::rusqlite::{
-            Error::SqliteFailure, OpenFlags, ffi, ffi::ErrorCode::CannotOpen,
-        };
-
-        // The default flags rusqlite's open fn uses. First we try opening
-        // and disallow creating a new DB. Then we allow creating a new DB.
-        // This allows us to know when a new DB was created and act accordingly.
-        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_URI
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-
-        let (conn, is_new) = match self
-            .connection_builder()
-            .open_with_flags(path.as_ref(), flags)
-            .await
-        {
+        let conn = match self.connection_builder().open(path.as_ref()).await {
             // All good:
-            Ok(conn) => (conn, false),
-            // Can't open the file; try again but allow creating it:
-            Err(SqliteFailure(
-                ffi::Error {
-                    code: CannotOpen, ..
-                },
-                _,
-            )) => {
-                let flags = flags | OpenFlags::SQLITE_OPEN_CREATE;
-                let conn = self
-                    .connection_builder()
-                    .open_with_flags(path, flags)
-                    .await
-                    .map_err(ConnectionError::Db)?;
-                (conn, true)
-            }
-            // Something else went wrong; just return the error.
+            Ok(conn) => conn,
+            // Something went wrong; just return the error.
             Err(e) => return Err(ConnectionError::Db(e)),
         };
-
-        let current_db_version = self.setup(&conn, is_new).await?;
-        Ok(ConnectionPendingMigrations::new(
-            conn,
-            self.migrations,
-            current_db_version,
-        ))
+        self.setup(conn).await
     }
 
     // A connection builder.
@@ -165,36 +120,54 @@ impl<E: Send + 'static> ConnectionBuilder<E> {
         builder
     }
 
-    // Perform any setup on the opened connection.
-    async fn setup(&self, conn: &Connection, is_new: bool) -> Result<i32, ConnectionError> {
+    // Perform any setup on the opened connection and return
+    // a connection pending migrations being applied.
+    async fn setup(
+        self,
+        conn: Connection,
+    ) -> Result<ConnectionPendingMigrations<E>, ConnectionError> {
         let app_id = self.app_id;
-        conn.call(move |conn| {
-            if is_new {
-                // Set up the app ID if this is a new DB.
-                conn.pragma_update(None, "application_id", app_id)
-                    .map_err(ConnectionError::Db)?;
-            } else {
-                // Check the app ID if this is not a new DB.
-                let val: i32 = conn
-                    .query_row("SELECT * from pragma_application_id", [], |row| row.get(0))
-                    .map_err(ConnectionError::Db)?;
-                if val != app_id {
-                    return Err(ConnectionError::WrongApplicationId(val));
+        let (current_db_version, is_new) = conn
+            .call(move |conn| {
+                // How much schema has been defined so far?
+                let schema_count: i32 =
+                    conn.query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))?;
+
+                // Which version is the DB at?
+                let user_version: i32 =
+                    conn.query_row("SELECT * FROM pragma_user_version", [], |row| row.get(0))?;
+
+                // A database is considered new if it has no schema, and is version 0.
+                // if either of these are not true, we do not treat it as new.
+                let is_new = schema_count == 0 && user_version == 0;
+
+                // If the database is _not_ new, we check the app ID and complain.
+                // If it _is_ new, then we'll set this at the start of performing
+                // migrations.
+                if !is_new {
+                    // Check the app ID if this is not a new DB.
+                    let val: i32 =
+                        conn.query_row("SELECT * from pragma_application_id", [], |row| {
+                            row.get(0)
+                        })?;
+                    if val != app_id {
+                        return Err(ConnectionError::WrongApplicationId(val));
+                    }
                 }
-            }
 
-            // Set foreign key constraint checking.
-            conn.pragma_update(None, "foreign_keys", true)
-                .map_err(ConnectionError::Db)?;
+                // Set foreign key constraint checking.
+                conn.pragma_update(None, "foreign_keys", true)?;
 
-            // Which version is the DB at (ie do we need to run any migrations)
-            let user_version: i32 = conn
-                .query_row("SELECT * FROM pragma_user_version", [], |row| row.get(0))
-                .map_err(ConnectionError::Db)?;
+                Ok((user_version, is_new))
+            })
+            .await?;
 
-            Ok(user_version)
-        })
-        .await
+        Ok(ConnectionPendingMigrations::new(
+            conn,
+            self.migrations,
+            current_db_version,
+            is_new.then_some(self.app_id),
+        ))
     }
 }
 
@@ -203,6 +176,9 @@ impl<E: Send + 'static> ConnectionBuilder<E> {
 pub struct ConnectionPendingMigrations<E = rusqlite::Error> {
     // Migrations to apply
     migrations: Migrations<E>,
+    // If this is provided, then we need to set the app ID. This
+    // means that the database is new and does not have it configured yet.
+    app_id_to_set: Option<i32>,
     // The current migration version we're up to in the DB (also 'user_version')
     current_db_version: i32,
     // The latest migration version our migrations take us up to
@@ -213,7 +189,12 @@ pub struct ConnectionPendingMigrations<E = rusqlite::Error> {
 
 impl<E: Send + 'static> ConnectionPendingMigrations<E> {
     // Crate-only function to init.
-    fn new(conn: Connection, migrations: Migrations<E>, current_db_version: i32) -> Self {
+    fn new(
+        conn: Connection,
+        migrations: Migrations<E>,
+        current_db_version: i32,
+        app_id_to_set: Option<i32>,
+    ) -> Self {
         // Which version are the given migrations at?
         let latest_migration_version = migrations
             .iter()
@@ -223,6 +204,7 @@ impl<E: Send + 'static> ConnectionPendingMigrations<E> {
 
         ConnectionPendingMigrations {
             migrations,
+            app_id_to_set,
             current_db_version,
             latest_migration_version,
             conn,
@@ -239,19 +221,6 @@ impl<E: Send + 'static> ConnectionPendingMigrations<E> {
         self.current_db_version < self.latest_migration_version
     }
 
-    /// Hand back a [`Connection`] without performing
-    /// migrations, returning `None` if there are migrations that
-    /// must be performed before the connection is ready, or if the
-    /// migrations we know about are not enough to align to the current
-    /// database version.
-    pub fn open_without_migrations(self) -> Option<Connection> {
-        if self.current_db_version == self.latest_migration_version {
-            Some(self.conn)
-        } else {
-            None
-        }
-    }
-
     /// Hand back a [`Connection`] after having performed
     /// the necessary migrations, returning an error if something
     /// related to migrating goes wrong.
@@ -264,6 +233,14 @@ impl<E: Send + 'static> ConnectionPendingMigrations<E> {
                 db_version: current_db_version,
                 latest_migration: self.latest_migration_version,
             });
+        }
+
+        // If the database is new, we set up the App ID for it. We do this
+        // regardless of whether any migrations will happen.
+        if let Some(app_id) = self.app_id_to_set {
+            self.conn
+                .call(move |conn| conn.pragma_update(None, "application_id", app_id))
+                .await?;
         }
 
         // If we need migrations, run them.

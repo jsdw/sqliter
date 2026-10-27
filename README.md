@@ -40,7 +40,7 @@ async fn open_connection() -> Result<Connection, Error> {
 
     // Migrations are not run until we ask for them. Here we could check
     // `pending.needs_migrations()` and, for instance, back up the database
-    // first, or use `pending.open_without_migrations()` to avoid migrating.
+    // first, or drop `pending` to leave the database unmodified.
     let conn = pending.open().await?;
     Ok(conn)
 }
