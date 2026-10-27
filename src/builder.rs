@@ -227,9 +227,29 @@ impl<E: Send + 'static> ConnectionPendingMigrations<E> {
         self.current_db_version < self.latest_migration_version
     }
 
+    /// Hand back a [`Connection`] without performing any migrations.
+    /// This will return [`None`] if migrations are needed, but because
+    /// it does not write to the database it is safe to call this multiple
+    /// times in parallel against the same database file.
+    pub fn open_without_migrating(self) -> Option<Connection> {
+        // If our migrations are out of date, bail without doing anything.
+        if self.current_db_version != self.latest_migration_version{
+            return None
+        }
+
+        Some(self.conn)
+    }
+
     /// Hand back a [`Connection`] after having performed
     /// the necessary migrations, returning an error if something
     /// related to migrating goes wrong.
+    ///
+    /// # Warning
+    ///
+    /// Do not run this against the same database more than once at a
+    /// time; doing so risks migrations being applied multiple times or
+    /// out of order. If you need to open multiple instances of the
+    /// same database, use [`Self::open_without_migrating`].
     pub async fn open(self) -> Result<Connection, MigrationsError<E>> {
         let current_db_version = self.current_db_version;
 
