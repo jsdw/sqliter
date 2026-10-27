@@ -8,14 +8,15 @@
 //! ```rust
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! use sqliter::{ Connection, ConnectionBuilder, ConnectionBuilderError };
+//! use sqliter::{ Connection, ConnectionBuilder, Error };
 //!
-//! async fn open_connection() -> Result<Connection, ConnectionBuilderError> {
+//! async fn open_connection() -> Result<Connection, Error> {
 //!     // This must never change for a given app; the database won't open if
 //!     // the app_id does not equal the one we have set here.
 //!     const APP_ID: i32 = 1337;
 //!
-//!     ConnectionBuilder::new()
+//!     // Use `.database(path)` instead of `.in_memory()` to open a database file.
+//!     let pending = ConnectionBuilder::new()
 //!         .app_id(APP_ID)
 //!         // Migrations should never change; this list will simply grow over time
 //!         // To accomodate the updates needed as the app matures.
@@ -27,8 +28,14 @@
 //!             conn.execute("ALTER TABLE user ADD COLUMN name TEXT NOT NULL DEFAULT 'Unknown'", ())
 //!                 .map(|_| ())
 //!         })
-//!         .open_in_memory()
-//!         .await
+//!         .in_memory()
+//!         .await?;
+//!
+//!     // Migrations are not run until we ask for them. Here we could check
+//!     // `pending.needs_migrations()` and, for instance, back up the database
+//!     // first, or use `pending.open_without_migrations()` to avoid migrating.
+//!     let conn = pending.open().await?;
+//!     Ok(conn)
 //! }
 //!
 //! let conn = open_connection().await?;
@@ -50,7 +57,7 @@ mod builder;
 mod error;
 mod migrations;
 
-pub use builder::ConnectionBuilder;
+pub use builder::{ ConnectionBuilder, ConnectionPendingMigrations };
 pub use error::{ Error, ConnectionError, MigrationsError };
 pub use migrations::Migrations;
 
@@ -115,7 +122,10 @@ mod test {
     async fn invalid_migration_version() {
         ConnectionBuilder::new()
             .add_migration(0, users_table)
-            .open_in_memory()
+            .in_memory()
+            .await
+            .unwrap()
+            .open()
             .await
             .unwrap();
     }
@@ -124,7 +134,10 @@ mod test {
     async fn migration_is_applied() {
         let conn = ConnectionBuilder::new()
             .add_migration(7, users_table)
-            .open_in_memory()
+            .in_memory()
+            .await
+            .unwrap()
+            .open()
             .await
             .unwrap();
 
@@ -149,7 +162,10 @@ mod test {
         // open first time with 1 migration:
         let conn = ConnectionBuilder::new()
             .add_migration(1, users_table)
-            .open(&path)
+            .database(&path)
+            .await
+            .unwrap()
+            .open()
             .await
             .unwrap();
 
@@ -160,7 +176,10 @@ mod test {
         let conn = ConnectionBuilder::new()
             .add_migration(1, users_table)
             .add_migration(2, data_table)
-            .open(&path)
+            .database(&path)
+            .await
+            .unwrap()
+            .open()
             .await
             .unwrap();
 
@@ -195,7 +214,10 @@ mod test {
         let conn = ConnectionBuilder::new()
             .app_id(APP_ID)
             .add_migration(1, users_table)
-            .open(&path)
+            .database(&path)
+            .await
+            .unwrap()
+            .open()
             .await
             .expect("can open db");
 
@@ -206,7 +228,10 @@ mod test {
         let conn = ConnectionBuilder::new()
             .app_id(APP_ID)
             .add_migration(1, users_table)
-            .open(&path)
+            .database(&path)
+            .await
+            .unwrap()
+            .open()
             .await
             .expect("can open db");
 
@@ -217,7 +242,7 @@ mod test {
         let conn = ConnectionBuilder::new()
             .app_id(DIFFERENT_APP_ID)
             .add_migration(1, users_table)
-            .open(&path)
+            .database(&path)
             .await;
 
         assert!(matches!(
@@ -235,7 +260,10 @@ mod test {
         let conn = ConnectionBuilder::new()
             .add_migration(1, users_table)
             .add_migration(2, data_table)
-            .open(&path)
+            .database(&path)
+            .await
+            .unwrap()
+            .open()
             .await
             .unwrap();
 
@@ -243,18 +271,86 @@ mod test {
 
         // open again with just one migration. This could happen
         // if eg older software tries opening newer db.
-        let conn = ConnectionBuilder::new()
+        let pending = ConnectionBuilder::new()
             .add_migration(1, users_table)
-            .open(&path)
-            .await;
+            .database(&path)
+            .await
+            .unwrap();
+
+        assert!(pending.is_out_of_date());
+        assert!(!pending.needs_migrations());
 
         assert!(matches!(
-            conn,
-            Err(ConnectionError::OutOfDate {
+            pending.open().await,
+            Err(MigrationsError::OutOfDate {
                 db_version: 2,
                 latest_migration: 1
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn migrations_only_run_when_asked() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test-db1.app");
+
+        // A new DB with migrations needs migrating, so can't be opened without them:
+        let pending = ConnectionBuilder::new()
+            .add_migration(1, users_table)
+            .database(&path)
+            .await
+            .unwrap();
+
+        assert!(pending.needs_migrations());
+        assert!(!pending.is_out_of_date());
+        assert!(pending.open_without_migrations().is_none());
+
+        // Nothing should have been migrated:
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(get_user_version_rusqlite(&conn), 0);
+        drop(conn);
+
+        // Now migrate the DB:
+        let conn = ConnectionBuilder::new()
+            .add_migration(1, users_table)
+            .database(&path)
+            .await
+            .unwrap()
+            .open()
+            .await
+            .unwrap();
+
+        assert_eq!(get_user_version(&conn).await, 1);
+        drop(conn);
+
+        // Once migrated, we can open without migrations:
+        let pending = ConnectionBuilder::new()
+            .add_migration(1, users_table)
+            .database(&path)
+            .await
+            .unwrap();
+
+        assert!(!pending.needs_migrations());
+        let conn = pending
+            .open_without_migrations()
+            .expect("no migrations needed");
+        assert_eq!(get_user_version(&conn).await, 1);
+    }
+
+    #[tokio::test]
+    async fn no_migrations_can_open_without_migrations() {
+        let pending = ConnectionBuilder::<rusqlite::Error>::new()
+            .in_memory()
+            .await
+            .unwrap();
+
+        assert!(!pending.needs_migrations());
+        assert!(!pending.is_out_of_date());
+
+        let conn = pending
+            .open_without_migrations()
+            .expect("no migrations needed");
+        assert_eq!(get_user_version(&conn).await, 0);
     }
 
     #[tokio::test]
@@ -265,7 +361,10 @@ mod test {
         // open with 1 valid migrations:
         let conn = ConnectionBuilder::new()
             .add_migration(1, users_table)
-            .open(&path)
+            .database(&path)
+            .await
+            .unwrap()
+            .open()
             .await
             .unwrap();
 
@@ -280,10 +379,16 @@ mod test {
                 conn.execute("SOME GARBAGE", [])?;
                 Ok(())
             })
-            .open(&path)
+            .database(&path)
+            .await
+            .unwrap()
+            .open()
             .await;
 
-        assert!(matches!(conn, Err(ConnectionError::Migration(_))));
+        assert!(matches!(
+            conn,
+            Err(MigrationsError::MigrationFailed { version: 3, .. })
+        ));
 
         // Check that user version was set to 2:
         let conn = rusqlite::Connection::open(&path).unwrap();
@@ -293,7 +398,10 @@ mod test {
         let conn = ConnectionBuilder::new()
             .add_migration(1, users_table)
             .add_migration(2, data_table)
-            .open(&path)
+            .database(&path)
+            .await
+            .unwrap()
+            .open()
             .await
             .unwrap();
 
@@ -314,10 +422,16 @@ mod test {
                 users_table(conn).expect("should work");
                 Err(rusqlite::Error::InvalidQuery)
             })
-            .open(&path)
+            .database(&path)
+            .await
+            .unwrap()
+            .open()
             .await;
 
-        assert!(matches!(conn, Err(ConnectionError::Migration(_))));
+        assert!(matches!(
+            conn,
+            Err(MigrationsError::MigrationFailed { version: 1, .. })
+        ));
 
         // Check that user version was not updated:
         let conn = rusqlite::Connection::open(&path).unwrap();

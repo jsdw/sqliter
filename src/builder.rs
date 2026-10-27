@@ -88,8 +88,8 @@ impl<E: Send + 'static> ConnectionBuilder<E> {
         self
     }
 
-    /// Open a connection to an in-memory database.
-    pub async fn from_memory(mut self) -> Result<ConnectionPendingMigrations<E>, ConnectionError> {
+    /// Prepare to open a connection to an in-memory database.
+    pub async fn in_memory(mut self) -> Result<ConnectionPendingMigrations<E>, ConnectionError> {
         let conn = self
             .connection_builder()
             .open_in_memory()
@@ -100,8 +100,8 @@ impl<E: Send + 'static> ConnectionBuilder<E> {
         Ok(ConnectionPendingMigrations::new(conn, self.migrations, current_db_version))
     }
 
-    /// Open a connection to a database at some file.
-    pub async fn from_file<P: AsRef<Path>>(
+    /// Prepare to open a connection to a database file at some path.
+    pub async fn database<P: AsRef<Path>>(
         mut self,
         path: P,
     ) -> Result<ConnectionPendingMigrations<E>, ConnectionError> {
@@ -230,18 +230,20 @@ impl<E: Send + 'static> ConnectionPendingMigrations<E> {
         self.current_db_version < self.latest_migration_version
     }
 
-    /// Hand back a [`rusqlite::Connection`] without performing
+    /// Hand back a [`Connection`] without performing
     /// migrations, returning `None` if there are migrations that
-    /// must be performed before the connection is ready.
-    pub async fn open_without_migrations(self) -> Option<Connection> {
-        if self.needs_migrations() {
-            None
-        } else {
+    /// must be performed before the connection is ready, or if the
+    /// migrations we know about are not enough to align to the current
+    /// database version.
+    pub fn open_without_migrations(self) -> Option<Connection> {
+        if self.current_db_version == self.latest_migration_version {
             Some(self.conn)
+        } else {
+            None
         }
     }
 
-    /// Hand back a [`rusqlite::Connection`] after having performed
+    /// Hand back a [`Connection`] after having performed
     /// the necessary migrations, returning an error if something
     /// related to migrating goes wrong.
     pub async fn open(self) -> Result<Connection, MigrationsError<E>> {
