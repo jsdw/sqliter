@@ -3,7 +3,8 @@
 - **Breaking:** Opening a connection is now split into two steps, so that you can be explicit about whether to perform migrations.
   - `ConnectionBuilder::open` and `ConnectionBuilder::open_in_memory` are renamed to `ConnectionBuilder::database` and `ConnectionBuilder::in_memory`, and now return a `ConnectionPendingMigrations`.
   - `ConnectionPendingMigrations::open()` performs any necessary migrations (and sets the app ID on a new database) before returning the `Connection`. Dropping the `ConnectionPendingMigrations` instead leaves the database unmodified.
-  - `ConnectionPendingMigrations::needs_migrations()` and `ConnectionPendingMigrations::is_out_of_date()` can be used to inspect the database before deciding what to do.
+  - `ConnectionPendingMigrations::open_without_migrating()` returns the `Connection` only if the database is already at the latest migration version (and sets the app ID on a new database), without performing any migrations. Unlike `open()`, this is safe to call against the same database concurrently.
+  - `ConnectionPendingMigrations::needs_migrations()`, `is_out_of_date()`, `is_new()`, `current_version()` and `latest_version()` can be used to inspect the database before deciding what to do.
 - Fix migrations sometimes being applied out of order when they were not added in ascending version order.
 - **Breaking:** Adding a migration with the same version as an existing one now panics.
 - **Breaking:** `ConnectionBuilderError` is replaced by `ConnectionError` (opening the database) and `MigrationsError` (performing migrations). Both convert into the new overarching `Error` type.
@@ -11,8 +12,9 @@
   - `ConnectionError::WrongApplicationId` now reports both the `expected` and `found` app IDs.
 - **Breaking:** `ConnectionBuilder::new()` now always uses `rusqlite::Error` as the migration error type, so that the type can be inferred when no migrations are given. Use `ConnectionBuilder::default()` to use some other error type.
 - **Breaking:** `ConnectionPendingMigrations::open()` returns `MigrationsError::UnknownVersion` if the database is at a version which doesn't match any known migration.
-- **Breaking:** `ConnectionPendingMigrations::open()` returns `MigrationsError::TransactionLeftOpen` (and rolls back the open transaction) if a non-transactional migration leaves a transaction open.
+- **Breaking:** `ConnectionPendingMigrations::open()` returns `MigrationsError::TransactionLeftOpen` (and rolls back the open transaction) if a non-transactional migration leaves a transaction open. A transaction left open by a failing non-transactional migration is also rolled back.
 - Migrations are now `FnOnce` rather than `Fn`, so they can move captured values.
+- `ConnectionBuilder`, `ConnectionPendingMigrations` and `Migrations` now implement `Debug`.
 - Add `ConnectionBuilder::with_wal()` to set the journal mode to WAL (and `synchronous` to `NORMAL` if WAL was enabled) when the connection is opened.
 
 # 0.7.0

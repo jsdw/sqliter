@@ -1,7 +1,7 @@
 /// Any error in `sqliter` can convert into this overarching type.
 #[derive(Debug, thiserror::Error)]
 pub enum Error<E = rusqlite::Error> {
-    #[error("Cannot build the connection")]
+    #[error("Cannot open the database")]
     Connection(#[from] ConnectionError),
     #[error("Cannot migrate the database")]
     Migrations(#[from] MigrationsError<E>),

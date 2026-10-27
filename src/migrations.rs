@@ -14,6 +14,14 @@ impl<E> Default for Migrations<E> {
     }
 }
 
+impl<E> std::fmt::Debug for Migrations<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Migrations")
+            .field("versions", &self.migrations.keys())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<E> Migrations<E> {
     /// Construct a new set of migrations.
     #[must_use]

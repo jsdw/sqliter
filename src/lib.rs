@@ -680,6 +680,62 @@ mod test {
         assert_eq!(tables, 0);
     }
 
+    #[tokio::test]
+    async fn failing_non_transactional_migration_rolls_back_open_transaction() {
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let res = ConnectionBuilder::new()
+            .on_close(move |conn| {
+                let _ = tx.send(conn.map(|c| c.is_autocommit()));
+            })
+            .add_migration_non_transactionally(1, |conn| {
+                conn.execute_batch("BEGIN")?;
+                users_table(conn)?;
+                Err(rusqlite::Error::InvalidQuery)
+            })
+            .in_memory()
+            .await
+            .unwrap()
+            .open()
+            .await;
+
+        assert!(matches!(
+            res,
+            Err(MigrationsError::MigrationFailed { version: 1, .. })
+        ));
+
+        // The connection handed to on_close should no longer be in a transaction.
+        assert_eq!(rx.recv().unwrap(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn pending_migrations_reports_versions() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test-db1.app");
+
+        let pending = ConnectionBuilder::new()
+            .add_migration(1, users_table)
+            .add_migration(2, data_table)
+            .database(&path)
+            .await
+            .unwrap();
+
+        assert!(pending.is_new());
+        assert_eq!(pending.current_version(), 0);
+        assert_eq!(pending.latest_version(), 2);
+        pending.open().await.unwrap();
+
+        let pending = ConnectionBuilder::new()
+            .add_migration(1, users_table)
+            .database(&path)
+            .await
+            .unwrap();
+
+        assert!(!pending.is_new());
+        assert_eq!(pending.current_version(), 2);
+        assert_eq!(pending.latest_version(), 1);
+    }
+
     fn get_journal_mode_rusqlite(conn: &rusqlite::Connection) -> String {
         conn.pragma_query_value(None, "journal_mode", |row| row.get(0))
             .expect("journal_mode expected")

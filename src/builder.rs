@@ -31,6 +31,17 @@ impl<E> Default for ConnectionBuilder<E> {
     }
 }
 
+impl<E> std::fmt::Debug for ConnectionBuilder<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionBuilder")
+            .field("app_id", &self.app_id)
+            .field("migrations", &self.migrations)
+            .field("on_close", &self.on_close.is_some())
+            .field("wal", &self.wal)
+            .finish()
+    }
+}
+
 impl ConnectionBuilder {
     /// Construct a new connection builder whose migrations return
     /// [`rusqlite::Error`]s.
@@ -247,6 +258,19 @@ pub struct ConnectionPendingMigrations<E = rusqlite::Error> {
     conn: Connection,
 }
 
+impl<E> std::fmt::Debug for ConnectionPendingMigrations<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionPendingMigrations")
+            .field("migrations", &self.migrations)
+            .field("app_id_to_set", &self.app_id_to_set)
+            .field("current_db_version", &self.current_db_version)
+            .field("latest_migration_version", &self.latest_migration_version)
+            .field("wal", &self.wal)
+            .field("conn", &self.conn)
+            .finish()
+    }
+}
+
 impl<E: Send + 'static> ConnectionPendingMigrations<E> {
     // Crate-only function to init.
     fn new(
@@ -268,6 +292,27 @@ impl<E: Send + 'static> ConnectionPendingMigrations<E> {
         }
     }
 
+    /// The version that the database is currently at (its `user_version`).
+    #[must_use]
+    pub fn current_version(&self) -> i32 {
+        self.current_db_version
+    }
+
+    /// The highest migration version that we know about, or 0 if there are no
+    /// migrations. This is the version the database will be at after
+    /// [`Self::open`] succeeds.
+    #[must_use]
+    pub fn latest_version(&self) -> i32 {
+        self.latest_migration_version
+    }
+
+    /// Is this a new database? A new database has no schema and is at version 0,
+    /// and will have its app ID set when it is opened.
+    #[must_use]
+    pub fn is_new(&self) -> bool {
+        self.app_id_to_set.is_some()
+    }
+
     /// Are the migrations we know about behind the current database?
     #[must_use]
     pub fn is_out_of_date(&self) -> bool {
@@ -281,21 +326,29 @@ impl<E: Send + 'static> ConnectionPendingMigrations<E> {
     }
 
     /// Hand back a [`Connection`] without performing any migrations.
-    /// This will return [`None`] if migrations are needed. Aside from enabling
-    /// WAL if [`ConnectionBuilder::with_wal`] was used (which does nothing if
-    /// WAL is already enabled), this does not write to the database, so it is
-    /// safe to call this multiple times in parallel against the same database file.
+    /// This will return [`None`] if migrations are needed (see [`Self::needs_migrations`])
+    /// or if the database is newer than our migrations (see [`Self::is_out_of_date`]).
     ///
     /// # Errors
     ///
-    /// Returns an error if WAL was asked for and setting it fails.
+    /// Returns an error if WAL was asked for and setting it fails, or if
+    /// the database is new and setting the app ID fails.
     pub async fn open_without_migrating(self) -> Result<Option<Connection>, ConnectionError> {
-        // If our migrations are out of date, bail without doing anything.
+        // If the database isn't at the version our migrations take it to, bail without doing anything.
         if self.current_db_version != self.latest_migration_version {
             return Ok(None);
         }
 
         self.enable_wal_if_needed().await?;
+
+        // If the database is new, we set up the App ID for it. We do this
+        // regardless of whether any migrations will happen.
+        if let Some(app_id) = self.app_id_to_set {
+            self.conn
+                .call(move |conn| conn.pragma_update(None, "application_id", app_id))
+                .await?;
+        }
+
         Ok(Some(self.conn))
     }
 
@@ -309,6 +362,11 @@ impl<E: Send + 'static> ConnectionPendingMigrations<E> {
     /// time; doing so risks migrations being applied multiple times or
     /// out of order. If you need to open multiple instances of the
     /// same database, use [`Self::open_without_migrating`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be migrated. See
+    /// [`MigrationsError`] for the possible reasons.
     pub async fn open(self) -> Result<Connection, MigrationsError<E>> {
         let current_db_version = self.current_db_version;
 
@@ -362,16 +420,24 @@ impl<E: Send + 'static> ConnectionPendingMigrations<E> {
                                 // the database being in an invalid state. Sometimes though, we need to
                                 // control the transaction behaviour inside the migration, so this is
                                 // the best we can do.
-                                migration(conn).map_err(|e| MigrationsError::MigrationFailed {
+                                let result = migration(conn);
+
+                                // Whether or not the migration succeeded, if it left a transaction
+                                // open then roll back whatever it left uncommitted. We'll be returning
+                                // an error either way, so ignore any rollback error.
+                                let left_transaction_open = !conn.is_autocommit();
+                                if left_transaction_open {
+                                    let _ = conn.execute_batch("ROLLBACK");
+                                }
+
+                                result.map_err(|e| MigrationsError::MigrationFailed {
                                     version,
                                     reason: e,
                                 })?;
 
-                                // If the migration left a transaction open, then it hasn't really
-                                // completed, so roll back whatever it left uncommitted and complain.
-                                // We're already returning an error, so ignore any rollback error.
-                                if !conn.is_autocommit() {
-                                    let _ = conn.execute_batch("ROLLBACK");
+                                // If the migration succeeded but left a transaction open, then it
+                                // hasn't really completed, so complain.
+                                if left_transaction_open {
                                     return Err(MigrationsError::TransactionLeftOpen { version });
                                 }
 
