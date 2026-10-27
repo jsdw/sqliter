@@ -57,8 +57,8 @@ mod builder;
 mod error;
 mod migrations;
 
-pub use builder::{ ConnectionBuilder, ConnectionPendingMigrations };
-pub use error::{ Error, ConnectionError, MigrationsError };
+pub use builder::{ConnectionBuilder, ConnectionPendingMigrations};
+pub use error::{ConnectionError, Error, MigrationsError};
 pub use migrations::Migrations;
 
 // Export these since we are just a thin wrapper around them.

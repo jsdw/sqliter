@@ -12,27 +12,26 @@ pub enum Error<E = rusqlite::Error> {
 pub enum MigrationsError<E = rusqlite::Error> {
     #[error("Connection unexpectedly closed during migrations")]
     UnexpectedlyClosed,
-    #[error("App out of date; database at version {db_version} but app works with version {latest_migration}")]
+    #[error(
+        "App out of date; database at version {db_version} but app works with version {latest_migration}"
+    )]
     OutOfDate {
         db_version: i32,
         latest_migration: i32,
     },
     #[error("Migration to version {version} failed: {reason}")]
-    MigrationFailed {
-        version: i32,
-        reason: E
-    },
+    MigrationFailed { version: i32, reason: E },
     #[error("Database error: {0}")]
     Db(rusqlite::Error),
 }
 
-impl <E> From<async_rusqlite::AlreadyClosed> for MigrationsError<E> {
+impl<E> From<async_rusqlite::AlreadyClosed> for MigrationsError<E> {
     fn from(_value: async_rusqlite::AlreadyClosed) -> Self {
         MigrationsError::UnexpectedlyClosed
     }
 }
 
-impl <E> From<rusqlite::Error> for MigrationsError<E> {
+impl<E> From<rusqlite::Error> for MigrationsError<E> {
     fn from(value: rusqlite::Error) -> Self {
         MigrationsError::Db(value)
     }
