@@ -1,58 +1,69 @@
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum ConnectionBuilderError<E = rusqlite::Error> {
+/// Any error in `sqliter` can convert into this overarching type.
+#[derive(Debug, thiserror::Error)]
+pub enum Error<E = rusqlite::Error> {
+    #[error("Cannot open the database")]
+    Connection(#[from] ConnectionError),
+    #[error("Cannot migrate the database")]
+    Migrations(#[from] MigrationsError<E>),
+}
+
+/// An error relating to the migrations.
+#[derive(Debug, thiserror::Error)]
+pub enum MigrationsError<E = rusqlite::Error> {
+    #[error("Connection unexpectedly closed during migrations")]
     UnexpectedlyClosed,
-    WrongApplicationId(i32),
+    #[error(
+        "App out of date; database at version {db_version} but app works with version {latest_migration}"
+    )]
     OutOfDate {
         db_version: i32,
         latest_migration: i32,
     },
-    Db(rusqlite::Error),
-    Migration(E),
+    #[error("Database at version {db_version}, which does not match any known migration version")]
+    UnknownVersion { db_version: i32 },
+    #[error("Migration to version {version} failed")]
+    MigrationFailed {
+        version: i32,
+        #[source]
+        reason: E,
+    },
+    #[error("Non-transactional migration to version {version} left a transaction open")]
+    TransactionLeftOpen { version: i32 },
+    #[error("Database error")]
+    Db(#[source] rusqlite::Error),
 }
 
-impl<E: std::fmt::Display> std::fmt::Display for ConnectionBuilderError<E> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConnectionBuilderError::UnexpectedlyClosed => {
-                write!(f, "Connection unexpectedly closed")
-            }
-            ConnectionBuilderError::WrongApplicationId(n) => {
-                write!(f, "Wrong application ID; got {n}")
-            }
-            ConnectionBuilderError::OutOfDate {
-                db_version,
-                latest_migration,
-            } => write!(
-                f,
-                "App out of date; database at version {db_version} but app works with version {latest_migration}"
-            ),
-            ConnectionBuilderError::Db(err) => write!(f, "Database error: {err}"),
-            ConnectionBuilderError::Migration(err) => write!(f, "Migration error: {err}"),
-        }
-    }
-}
-
-impl<E: std::error::Error + 'static> std::error::Error for ConnectionBuilderError<E> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            ConnectionBuilderError::UnexpectedlyClosed
-            | ConnectionBuilderError::WrongApplicationId(_)
-            | ConnectionBuilderError::OutOfDate { .. } => None,
-            ConnectionBuilderError::Db(err) => Some(err),
-            ConnectionBuilderError::Migration(err) => Some(err),
-        }
-    }
-}
-
-impl<E> From<rusqlite::Error> for ConnectionBuilderError<E> {
-    fn from(value: rusqlite::Error) -> Self {
-        ConnectionBuilderError::Db(value)
-    }
-}
-
-impl<E> From<async_rusqlite::AlreadyClosed> for ConnectionBuilderError<E> {
+impl<E> From<async_rusqlite::AlreadyClosed> for MigrationsError<E> {
     fn from(_value: async_rusqlite::AlreadyClosed) -> Self {
-        ConnectionBuilderError::UnexpectedlyClosed
+        MigrationsError::UnexpectedlyClosed
+    }
+}
+
+impl<E> From<rusqlite::Error> for MigrationsError<E> {
+    fn from(value: rusqlite::Error) -> Self {
+        MigrationsError::Db(value)
+    }
+}
+
+/// An error relating to the database or connection to it.
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectionError {
+    #[error("Connection unexpectedly closed")]
+    UnexpectedlyClosed,
+    #[error("Wrong application ID: expected {expected} but found {found}")]
+    WrongApplicationId { expected: i32, found: i32 },
+    #[error("Database error")]
+    Db(#[source] rusqlite::Error),
+}
+
+impl From<async_rusqlite::AlreadyClosed> for ConnectionError {
+    fn from(_value: async_rusqlite::AlreadyClosed) -> Self {
+        ConnectionError::UnexpectedlyClosed
+    }
+}
+
+impl From<rusqlite::Error> for ConnectionError {
+    fn from(value: rusqlite::Error) -> Self {
+        ConnectionError::Db(value)
     }
 }

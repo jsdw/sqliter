@@ -1,10 +1,10 @@
 [package]
 name = "sqliter"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.89"
 authors = ["james@jsdw.me"]
-description = "An opinionated async connnection/migration handler for rusqlite to make light work of using sqlite databases for small apps"
+description = "An opinionated async connection/migration handler for rusqlite to make light work of using sqlite databases for small apps"
 license = "MIT"
 repository = "https://github.com/jsdw/sqliter"
 documentation = "https://docs.rs/sqliter"
@@ -15,6 +15,7 @@ async-rusqlite = "0.6.0"
 # Must match the rusqlite version used by async-rusqlite (only one bundled
 # libsqlite3-sys can be linked); we depend on it directly to enable "bundled".
 rusqlite = { version = "0.41.0", features = ["bundled"] }
+thiserror = "2.0.21"
 
 [dev-dependencies]
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros"] }

@@ -12,17 +12,18 @@ Built on [`async-rusqlite`](https://crates.io/crates/async-rusqlite); a thin asy
 ## Example
 
 ```rust
-use sqliter::{Connection, ConnectionBuilder, ConnectionBuilderError};
+use sqliter::{Connection, ConnectionBuilder, Error};
 
-async fn open_connection() -> Result<Connection, ConnectionBuilderError> {
+async fn open_connection() -> Result<Connection, Error> {
     // This must never change for a given app; the database won't open if
     // the app_id does not equal the one we have set here.
     const APP_ID: i32 = 1337;
 
-    ConnectionBuilder::new()
+    // Use `.database(path)` instead of `.in_memory()` to open a database file.
+    let pending = ConnectionBuilder::new()
         .app_id(APP_ID)
         // Migrations should never change; this list will simply grow over time
-        // To accomodate the updates needed as the app matures.
+        // to accommodate the updates needed as the app matures.
         .add_migration(1, |conn| {
             conn.execute("CREATE TABLE user ( id INTEGER PRIMARY KEY )", ())
                 .map(|_| ())
@@ -34,8 +35,14 @@ async fn open_connection() -> Result<Connection, ConnectionBuilderError> {
             )
             .map(|_| ())
         })
-        .open_in_memory()
-        .await
+        .in_memory()
+        .await?;
+
+    // Migrations are not run until we ask for them. Here we could check
+    // `pending.needs_migrations()` and, for instance, back up the database
+    // first, or drop `pending` to leave the database unmodified.
+    let conn = pending.open().await?;
+    Ok(conn)
 }
 
 #[tokio::main]
