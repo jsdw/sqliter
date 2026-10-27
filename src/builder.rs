@@ -16,6 +16,8 @@ pub struct ConnectionBuilder<E = rusqlite::Error> {
     migrations: Migrations<E>,
     // Function to call when the db thread shuts down
     on_close: Option<Box<dyn FnOnce(Option<rusqlite::Connection>) + Send + 'static>>,
+    // Should we set the journal mode to WAL?
+    wal: bool,
 }
 
 impl<E> Default for ConnectionBuilder<E> {
@@ -24,6 +26,7 @@ impl<E> Default for ConnectionBuilder<E> {
             app_id: 0,
             migrations: Migrations::new(),
             on_close: None,
+            wal: false,
         }
     }
 }
@@ -60,6 +63,34 @@ impl<E: Send + 'static> ConnectionBuilder<E> {
     #[must_use]
     pub fn app_id(mut self, app_id: i32) -> Self {
         self.app_id = app_id;
+        self
+    }
+
+    /// Set the journal mode of the database to WAL and, if this succeeds, the
+    /// `synchronous` PRAGMA to `NORMAL`. This is done when the connection is opened via
+    /// [`ConnectionPendingMigrations::open`] or
+    /// [`ConnectionPendingMigrations::open_without_migrating`], before any
+    /// migrations are performed.
+    ///
+    /// The WAL journal mode is persisted in the database file, so once a
+    /// database has been opened with this, it will remain in WAL mode even if
+    /// it's opened without this in the future. The `synchronous` PRAGMA is not
+    /// persisted, and applies only to this connection.
+    ///
+    /// `synchronous = NORMAL` is the recommended setting in WAL mode: the database
+    /// cannot be corrupted, but the most recent transactions may be lost on power
+    /// failure or OS crash (though not if the application crashes). If you'd prefer
+    /// otherwise, set `synchronous` yourself once the connection is opened.
+    ///
+    /// SQLite does not complain if WAL cannot be enabled, and so neither do we.
+    /// For example, in-memory databases cannot use WAL and will be left in the
+    /// `memory` journal mode, and WAL may not be available on some network
+    /// filesystems or for read-only databases. In these cases, `synchronous` is
+    /// left unchanged, since `NORMAL` carries a small risk of database corruption
+    /// on power failure in non-WAL modes.
+    #[must_use]
+    pub fn with_wal(mut self) -> Self {
+        self.wal = true;
         self
     }
 
@@ -193,6 +224,7 @@ impl<E: Send + 'static> ConnectionBuilder<E> {
             self.migrations,
             current_db_version,
             is_new.then_some(self.app_id),
+            self.wal,
         ))
     }
 }
@@ -209,6 +241,8 @@ pub struct ConnectionPendingMigrations<E = rusqlite::Error> {
     current_db_version: i32,
     // The latest migration version our migrations take us up to
     latest_migration_version: i32,
+    // Should we set the journal mode to WAL on opening?
+    wal: bool,
     // The underlying DB connection
     conn: Connection,
 }
@@ -220,6 +254,7 @@ impl<E: Send + 'static> ConnectionPendingMigrations<E> {
         migrations: Migrations<E>,
         current_db_version: i32,
         app_id_to_set: Option<i32>,
+        wal: bool,
     ) -> Self {
         let latest_migration_version = migrations.latest_version();
 
@@ -228,6 +263,7 @@ impl<E: Send + 'static> ConnectionPendingMigrations<E> {
             app_id_to_set,
             current_db_version,
             latest_migration_version,
+            wal,
             conn,
         }
     }
@@ -245,17 +281,22 @@ impl<E: Send + 'static> ConnectionPendingMigrations<E> {
     }
 
     /// Hand back a [`Connection`] without performing any migrations.
-    /// This will return [`None`] if migrations are needed, but because
-    /// it does not write to the database it is safe to call this multiple
-    /// times in parallel against the same database file.
-    #[must_use]
-    pub fn open_without_migrating(self) -> Option<Connection> {
+    /// This will return [`None`] if migrations are needed. Aside from enabling
+    /// WAL if [`ConnectionBuilder::with_wal`] was used (which does nothing if
+    /// WAL is already enabled), this does not write to the database, so it is
+    /// safe to call this multiple times in parallel against the same database file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if WAL was asked for and setting it fails.
+    pub async fn open_without_migrating(self) -> Result<Option<Connection>, ConnectionError> {
         // If our migrations are out of date, bail without doing anything.
         if self.current_db_version != self.latest_migration_version {
-            return None;
+            return Ok(None);
         }
 
-        Some(self.conn)
+        self.enable_wal_if_needed().await?;
+        Ok(Some(self.conn))
     }
 
     /// Hand back a [`Connection`] after having performed
@@ -286,6 +327,9 @@ impl<E: Send + 'static> ConnectionPendingMigrations<E> {
                 db_version: current_db_version,
             });
         }
+
+        // Enable WAL before anything else is written, so that migrations run in WAL mode.
+        self.enable_wal_if_needed().await?;
 
         // If the database is new, we set up the App ID for it. We do this
         // regardless of whether any migrations will happen.
@@ -342,5 +386,27 @@ impl<E: Send + 'static> ConnectionPendingMigrations<E> {
         }
 
         Ok(self.conn)
+    }
+
+    // Set the journal mode to WAL if this was asked for, and synchronous to NORMAL
+    // if WAL was successfully enabled. Setting WAL does nothing if it is already
+    // enabled. We don't complain if WAL could not be enabled.
+    async fn enable_wal_if_needed(&self) -> Result<(), rusqlite::Error> {
+        if self.wal {
+            self.conn
+                .call(|conn| {
+                    // This returns the journal mode now in effect, which may not be WAL.
+                    let mode: String =
+                        conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| {
+                            row.get(0)
+                        })?;
+                    if mode.eq_ignore_ascii_case("wal") {
+                        conn.pragma_update(None, "synchronous", "NORMAL")?;
+                    }
+                    Ok::<_, rusqlite::Error>(())
+                })
+                .await?;
+        }
+        Ok(())
     }
 }

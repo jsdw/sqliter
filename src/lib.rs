@@ -679,4 +679,128 @@ mod test {
             .unwrap();
         assert_eq!(tables, 0);
     }
+
+    fn get_journal_mode_rusqlite(conn: &rusqlite::Connection) -> String {
+        conn.pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("journal_mode expected")
+    }
+
+    async fn get_journal_mode(conn: &Connection) -> String {
+        conn.call(|conn| Ok::<_, rusqlite::Error>(get_journal_mode_rusqlite(conn)))
+            .await
+            .unwrap()
+    }
+
+    async fn get_synchronous(conn: &Connection) -> i32 {
+        conn.call(|conn| conn.pragma_query_value(None, "synchronous", |row| row.get(0)))
+            .await
+            .unwrap()
+    }
+
+    // Values of the synchronous PRAGMA:
+    const SYNCHRONOUS_NORMAL: i32 = 1;
+    const SYNCHRONOUS_FULL: i32 = 2;
+
+    #[tokio::test]
+    async fn wal_enabled_on_open() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test-db1.app");
+
+        let pending = ConnectionBuilder::new()
+            .with_wal()
+            .add_migration(1, users_table)
+            .database(&path)
+            .await
+            .unwrap();
+
+        // WAL isn't enabled until we open the connection:
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(get_journal_mode_rusqlite(&conn), "delete");
+        drop(conn);
+
+        let conn = pending.open().await.unwrap();
+        assert_eq!(get_journal_mode(&conn).await, "wal");
+        assert_eq!(get_synchronous(&conn).await, SYNCHRONOUS_NORMAL);
+        drop(conn);
+
+        // WAL is persisted, so remains enabled when opened without asking for it,
+        // but synchronous is not, so goes back to the default:
+        let conn = ConnectionBuilder::new()
+            .add_migration(1, users_table)
+            .database(&path)
+            .await
+            .unwrap()
+            .open()
+            .await
+            .unwrap();
+        assert_eq!(get_journal_mode(&conn).await, "wal");
+        assert_eq!(get_synchronous(&conn).await, SYNCHRONOUS_FULL);
+    }
+
+    #[tokio::test]
+    async fn wal_enabled_on_open_without_migrating() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test-db1.app");
+
+        // Migrate the database without WAL:
+        let conn = ConnectionBuilder::new()
+            .add_migration(1, users_table)
+            .database(&path)
+            .await
+            .unwrap()
+            .open()
+            .await
+            .unwrap();
+        assert_eq!(get_journal_mode(&conn).await, "delete");
+        drop(conn);
+
+        // If migrations are needed, we don't get a connection and WAL isn't enabled:
+        let conn = ConnectionBuilder::new()
+            .with_wal()
+            .add_migration(1, users_table)
+            .add_migration(2, data_table)
+            .database(&path)
+            .await
+            .unwrap()
+            .open_without_migrating()
+            .await
+            .unwrap();
+        assert!(conn.is_none());
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(get_journal_mode_rusqlite(&conn), "delete");
+        drop(conn);
+
+        // If no migrations are needed, WAL is enabled:
+        let conn = ConnectionBuilder::new()
+            .with_wal()
+            .add_migration(1, users_table)
+            .database(&path)
+            .await
+            .unwrap()
+            .open_without_migrating()
+            .await
+            .unwrap()
+            .expect("no migrations needed");
+        assert_eq!(get_journal_mode(&conn).await, "wal");
+        assert_eq!(get_synchronous(&conn).await, SYNCHRONOUS_NORMAL);
+    }
+
+    #[tokio::test]
+    async fn wal_ignored_for_in_memory_database() {
+        let conn = ConnectionBuilder::new()
+            .with_wal()
+            .add_migration(1, users_table)
+            .in_memory()
+            .await
+            .unwrap()
+            .open()
+            .await
+            .unwrap();
+
+        assert_eq!(get_journal_mode(&conn).await, "memory");
+        // WAL wasn't enabled, so synchronous is left at the default:
+        assert_eq!(get_synchronous(&conn).await, SYNCHRONOUS_FULL);
+        assert_eq!(get_user_version(&conn).await, 1);
+    }
 }

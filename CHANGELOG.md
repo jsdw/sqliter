@@ -13,6 +13,7 @@
 - **Breaking:** `ConnectionPendingMigrations::open()` returns `MigrationsError::UnknownVersion` if the database is at a version which doesn't match any known migration.
 - **Breaking:** `ConnectionPendingMigrations::open()` returns `MigrationsError::TransactionLeftOpen` (and rolls back the open transaction) if a non-transactional migration leaves a transaction open.
 - Migrations are now `FnOnce` rather than `Fn`, so they can move captured values.
+- Add `ConnectionBuilder::with_wal()` to set the journal mode to WAL (and `synchronous` to `NORMAL` if WAL was enabled) when the connection is opened.
 
 # 0.7.0
 
