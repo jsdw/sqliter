@@ -7,6 +7,12 @@
 - Fix migrations sometimes being applied out of order when they were not added in ascending version order.
 - **Breaking:** Adding a migration with the same version as an existing one now panics.
 - **Breaking:** `ConnectionBuilderError` is replaced by `ConnectionError` (opening the database) and `MigrationsError` (performing migrations). Both convert into the new overarching `Error` type.
+  - Underlying errors (including migration errors) are now exposed via `Error::source()` rather than being included in the error message.
+  - `ConnectionError::WrongApplicationId` now reports both the `expected` and `found` app IDs.
+- **Breaking:** `ConnectionBuilder::new()` now always uses `rusqlite::Error` as the migration error type, so that the type can be inferred when no migrations are given. Use `ConnectionBuilder::default()` to use some other error type.
+- **Breaking:** `ConnectionPendingMigrations::open()` returns `MigrationsError::UnknownVersion` if the database is at a version which doesn't match any known migration.
+- **Breaking:** `ConnectionPendingMigrations::open()` returns `MigrationsError::TransactionLeftOpen` (and rolls back the open transaction) if a non-transactional migration leaves a transaction open.
+- Migrations are now `FnOnce` rather than `Fn`, so they can move captured values.
 
 # 0.7.0
 

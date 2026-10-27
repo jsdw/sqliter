@@ -18,25 +18,33 @@ pub struct ConnectionBuilder<E = rusqlite::Error> {
     on_close: Option<Box<dyn FnOnce(Option<rusqlite::Connection>) + Send + 'static>>,
 }
 
-impl<E: Send + 'static> Default for ConnectionBuilder<E> {
+impl<E> Default for ConnectionBuilder<E> {
     fn default() -> Self {
-        Self::new()
+        Self {
+            app_id: 0,
+            migrations: Migrations::new(),
+            on_close: None,
+        }
+    }
+}
+
+impl ConnectionBuilder {
+    /// Construct a new connection builder whose migrations return
+    /// [`rusqlite::Error`]s.
+    ///
+    /// To use some other error type in migrations, construct the builder
+    /// using [`ConnectionBuilder::default()`] instead.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
 impl<E: Send + 'static> ConnectionBuilder<E> {
-    /// Construct a new connection builder.
-    pub fn new() -> Self {
-        Self {
-            app_id: 0,
-            migrations: Default::default(),
-            on_close: None,
-        }
-    }
-
     /// Configure a function to be called exactly once when the connection is closed.
     /// If the database has already been closed then it will be given `None`, else it
     /// will be handed the database connection.
+    #[must_use]
     pub fn on_close<F: FnOnce(Option<rusqlite::Connection>) + Send + 'static>(
         mut self,
         f: F,
@@ -49,6 +57,7 @@ impl<E: Send + 'static> ConnectionBuilder<E> {
     /// this Id must match else an error will be generated. This helps to
     /// ensure that the database we're trying to open is meant for the app
     /// we're running. Default to 0 if not set ("SQLite Database").
+    #[must_use]
     pub fn app_id(mut self, app_id: i32) -> Self {
         self.app_id = app_id;
         self
@@ -61,9 +70,10 @@ impl<E: Send + 'static> ConnectionBuilder<E> {
     ///
     /// Panics if the migration version given is not greater than 0, or if
     /// a migration with the same version has already been added.
+    #[must_use]
     pub fn add_migration<F>(mut self, version: i32, migration: F) -> Self
     where
-        F: Send + 'static + Fn(&rusqlite::Connection) -> Result<(), E>,
+        F: Send + 'static + FnOnce(&rusqlite::Connection) -> Result<(), E>,
     {
         self.migrations = self.migrations.add(version, migration);
         self
@@ -73,45 +83,54 @@ impl<E: Send + 'static> ConnectionBuilder<E> {
     ///
     /// Add a single migration to the list. The migration will not be performed
     /// inside a transaction. Use [`Self::add_migration`] unless you know what
-    /// you are doing.
+    /// you are doing. See [`Migrations::add_non_transactionally`] for more.
     ///
     /// # Panics
     ///
     /// Panics if the migration version given is not greater than 0, or if
     /// a migration with the same version has already been added.
+    #[must_use]
     pub fn add_migration_non_transactionally<F>(mut self, version: i32, migration: F) -> Self
     where
-        F: Send + 'static + Fn(&rusqlite::Connection) -> Result<(), E>,
+        F: Send + 'static + FnOnce(&rusqlite::Connection) -> Result<(), E>,
     {
         self.migrations = self.migrations.add_non_transactionally(version, migration);
         self
     }
 
     /// Use the provided set of migrations to ensure that the database we connect
-    /// to is uptodate. This uses the `user_version` PRAGMA to know which migrations
+    /// to is up to date. This uses the `user_version` PRAGMA to know which migrations
     /// to apply.
+    ///
+    /// This replaces any migrations previously given to this builder, including any
+    /// added via [`Self::add_migration`] or [`Self::add_migration_non_transactionally`].
+    #[must_use]
     pub fn set_migrations(mut self, migrations: Migrations<E>) -> Self {
         self.migrations = migrations;
         self
     }
 
     /// Prepare to open a connection to an in-memory database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be opened or inspected.
     pub async fn in_memory(mut self) -> Result<ConnectionPendingMigrations<E>, ConnectionError> {
         let conn = self.connection_builder().open_in_memory().await?;
         self.setup(conn).await
     }
 
     /// Prepare to open a connection to a database file at some path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be opened or inspected, or if
+    /// it is not new and its app ID does not match [`Self::app_id`].
     pub async fn database<P: AsRef<Path>>(
         mut self,
         path: P,
     ) -> Result<ConnectionPendingMigrations<E>, ConnectionError> {
-        let conn = match self.connection_builder().open(path.as_ref()).await {
-            // All good:
-            Ok(conn) => conn,
-            // Something went wrong; just return the error.
-            Err(e) => return Err(ConnectionError::Db(e)),
-        };
+        let conn = self.connection_builder().open(path.as_ref()).await?;
         self.setup(conn).await
     }
 
@@ -141,7 +160,7 @@ impl<E: Send + 'static> ConnectionBuilder<E> {
 
                 // Which version is the DB at?
                 let user_version: i32 =
-                    conn.query_row("SELECT * FROM pragma_user_version", [], |row| row.get(0))?;
+                    conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
 
                 // A database is considered new if it has no schema, and is version 0.
                 // if either of these are not true, we do not treat it as new.
@@ -152,12 +171,13 @@ impl<E: Send + 'static> ConnectionBuilder<E> {
                 // migrations.
                 if !is_new {
                     // Check the app ID if this is not a new DB.
-                    let val: i32 =
-                        conn.query_row("SELECT * from pragma_application_id", [], |row| {
-                            row.get(0)
-                        })?;
-                    if val != app_id {
-                        return Err(ConnectionError::WrongApplicationId(val));
+                    let found: i32 =
+                        conn.pragma_query_value(None, "application_id", |row| row.get(0))?;
+                    if found != app_id {
+                        return Err(ConnectionError::WrongApplicationId {
+                            expected: app_id,
+                            found,
+                        });
                     }
                 }
 
@@ -201,12 +221,7 @@ impl<E: Send + 'static> ConnectionPendingMigrations<E> {
         current_db_version: i32,
         app_id_to_set: Option<i32>,
     ) -> Self {
-        // Which version are the given migrations at?
-        let latest_migration_version = migrations
-            .iter()
-            .map(|(version, _, _)| version)
-            .max()
-            .unwrap_or(0);
+        let latest_migration_version = migrations.latest_version();
 
         ConnectionPendingMigrations {
             migrations,
@@ -218,11 +233,13 @@ impl<E: Send + 'static> ConnectionPendingMigrations<E> {
     }
 
     /// Are the migrations we know about behind the current database?
+    #[must_use]
     pub fn is_out_of_date(&self) -> bool {
         self.latest_migration_version < self.current_db_version
     }
 
     /// Does this connection need migrations in order to open?
+    #[must_use]
     pub fn needs_migrations(&self) -> bool {
         self.current_db_version < self.latest_migration_version
     }
@@ -231,10 +248,11 @@ impl<E: Send + 'static> ConnectionPendingMigrations<E> {
     /// This will return [`None`] if migrations are needed, but because
     /// it does not write to the database it is safe to call this multiple
     /// times in parallel against the same database file.
+    #[must_use]
     pub fn open_without_migrating(self) -> Option<Connection> {
         // If our migrations are out of date, bail without doing anything.
-        if self.current_db_version != self.latest_migration_version{
-            return None
+        if self.current_db_version != self.latest_migration_version {
+            return None;
         }
 
         Some(self.conn)
@@ -261,6 +279,14 @@ impl<E: Send + 'static> ConnectionPendingMigrations<E> {
             });
         }
 
+        // If the database version isn't one we know about, then our migrations
+        // probably don't belong to this database, so bail without doing anything.
+        if current_db_version != 0 && !self.migrations.contains_version(current_db_version) {
+            return Err(MigrationsError::UnknownVersion {
+                db_version: current_db_version,
+            });
+        }
+
         // If the database is new, we set up the App ID for it. We do this
         // regardless of whether any migrations will happen.
         if let Some(app_id) = self.app_id_to_set {
@@ -276,7 +302,7 @@ impl<E: Send + 'static> ConnectionPendingMigrations<E> {
                 .call(move |conn| {
                     // Attempt each migration atomically. If a migration fails, we don't
                     // want the DB to have been altered.
-                    for (version, perform_in_transaction, migration) in migrations.iter() {
+                    for (version, perform_in_transaction, migration) in migrations.into_ordered() {
                         if version > current_db_version {
                             if perform_in_transaction {
                                 // in one transaction, apply a migration and update the db version
@@ -296,6 +322,15 @@ impl<E: Send + 'static> ConnectionPendingMigrations<E> {
                                     version,
                                     reason: e,
                                 })?;
+
+                                // If the migration left a transaction open, then it hasn't really
+                                // completed, so roll back whatever it left uncommitted and complain.
+                                // We're already returning an error, so ignore any rollback error.
+                                if !conn.is_autocommit() {
+                                    let _ = conn.execute_batch("ROLLBACK");
+                                    return Err(MigrationsError::TransactionLeftOpen { version });
+                                }
+
                                 conn.pragma_update(None, "user_version", version)?;
                             }
                         }

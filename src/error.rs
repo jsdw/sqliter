@@ -1,9 +1,9 @@
 /// Any error in `sqliter` can convert into this overarching type.
 #[derive(Debug, thiserror::Error)]
 pub enum Error<E = rusqlite::Error> {
-    #[error("Cannot build the connection: {0}")]
+    #[error("Cannot build the connection")]
     Connection(#[from] ConnectionError),
-    #[error("Cannot migrate the database: {0}")]
+    #[error("Cannot migrate the database")]
     Migrations(#[from] MigrationsError<E>),
 }
 
@@ -19,10 +19,18 @@ pub enum MigrationsError<E = rusqlite::Error> {
         db_version: i32,
         latest_migration: i32,
     },
-    #[error("Migration to version {version} failed: {reason}")]
-    MigrationFailed { version: i32, reason: E },
-    #[error("Database error: {0}")]
-    Db(rusqlite::Error),
+    #[error("Database at version {db_version}, which does not match any known migration version")]
+    UnknownVersion { db_version: i32 },
+    #[error("Migration to version {version} failed")]
+    MigrationFailed {
+        version: i32,
+        #[source]
+        reason: E,
+    },
+    #[error("Non-transactional migration to version {version} left a transaction open")]
+    TransactionLeftOpen { version: i32 },
+    #[error("Database error")]
+    Db(#[source] rusqlite::Error),
 }
 
 impl<E> From<async_rusqlite::AlreadyClosed> for MigrationsError<E> {
@@ -42,10 +50,10 @@ impl<E> From<rusqlite::Error> for MigrationsError<E> {
 pub enum ConnectionError {
     #[error("Connection unexpectedly closed")]
     UnexpectedlyClosed,
-    #[error("Wrong application ID: got {0}")]
-    WrongApplicationId(i32),
-    #[error("Database error: {0}")]
-    Db(rusqlite::Error),
+    #[error("Wrong application ID: expected {expected} but found {found}")]
+    WrongApplicationId { expected: i32, found: i32 },
+    #[error("Database error")]
+    Db(#[source] rusqlite::Error),
 }
 
 impl From<async_rusqlite::AlreadyClosed> for ConnectionError {

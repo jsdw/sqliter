@@ -19,7 +19,7 @@
 //!     let pending = ConnectionBuilder::new()
 //!         .app_id(APP_ID)
 //!         // Migrations should never change; this list will simply grow over time
-//!         // To accomodate the updates needed as the app matures.
+//!         // to accommodate the updates needed as the app matures.
 //!         .add_migration(1, |conn| {
 //!             conn.execute("CREATE TABLE user ( id INTEGER PRIMARY KEY )", ())
 //!                 .map(|_| ())
@@ -99,11 +99,9 @@ mod test {
     }
 
     async fn get_app_id(conn: &Connection) -> i32 {
-        conn.call(|conn| {
-            conn.query_row("SELECT * from pragma_application_id", [], |row| row.get(0))
-        })
-        .await
-        .unwrap()
+        conn.call(|conn| conn.pragma_query_value(None, "application_id", |row| row.get(0)))
+            .await
+            .unwrap()
     }
 
     fn get_user_version_rusqlite(conn: &rusqlite::Connection) -> i32 {
@@ -117,23 +115,16 @@ mod test {
             .unwrap()
     }
 
-    #[tokio::test]
-    #[should_panic]
-    async fn invalid_migration_version() {
-        ConnectionBuilder::new()
-            .add_migration(0, users_table)
-            .in_memory()
-            .await
-            .unwrap()
-            .open()
-            .await
-            .unwrap();
+    #[test]
+    #[should_panic(expected = "migration version must be greater than 0")]
+    fn invalid_migration_version() {
+        let _ = ConnectionBuilder::new().add_migration(0, users_table);
     }
 
     #[test]
     #[should_panic(expected = "migration version 2 has already been added")]
     fn duplicate_migration_version() {
-        ConnectionBuilder::new()
+        let _ = ConnectionBuilder::new()
             .add_migration(1, users_table)
             .add_migration(2, data_table)
             .add_migration_non_transactionally(2, data_table);
@@ -171,7 +162,7 @@ mod test {
         let applied = Arc::new(Mutex::new(Vec::new()));
 
         // Add migrations out of order:
-        let mut builder = ConnectionBuilder::<rusqlite::Error>::new();
+        let mut builder = ConnectionBuilder::new();
         for version in [3, 5, 1, 4, 2] {
             let applied = applied.clone();
             builder = builder.add_migration(version, move |_conn| {
@@ -280,7 +271,10 @@ mod test {
 
         assert!(matches!(
             conn,
-            Err(ConnectionError::WrongApplicationId(APP_ID))
+            Err(ConnectionError::WrongApplicationId {
+                expected: DIFFERENT_APP_ID,
+                found: APP_ID
+            })
         ));
     }
 
@@ -346,7 +340,7 @@ mod test {
         let conn = rusqlite::Connection::open(&path).unwrap();
         assert_eq!(get_user_version_rusqlite(&conn), 0);
         let app_id: i32 = conn
-            .query_row("SELECT * from pragma_application_id", [], |row| row.get(0))
+            .pragma_query_value(None, "application_id", |row| row.get(0))
             .unwrap();
         assert_eq!(app_id, 0);
         drop(conn);
@@ -382,7 +376,7 @@ mod test {
     async fn app_id_set_without_migrations() {
         const APP_ID: i32 = 12345;
 
-        let pending = ConnectionBuilder::<rusqlite::Error>::new()
+        let pending = ConnectionBuilder::new()
             .app_id(APP_ID)
             .in_memory()
             .await
@@ -481,7 +475,7 @@ mod test {
         assert_eq!(get_user_version_rusqlite(&conn), 0);
 
         // But, users table should be accessible and contain what the failed migration
-        // added, since it wasn't in a transaction and thus wasnt rolled back.
+        // added, since it wasn't in a transaction and thus wasn't rolled back.
         let name: String = conn
             .query_row("SELECT name FROM users WHERE id = 1", [], |row| row.get(0))
             .unwrap();
@@ -554,5 +548,135 @@ mod test {
         let path = tempdir.path().join("test-db1.app");
 
         assert!(on_close_called_with_connection(&path).await);
+    }
+
+    #[tokio::test]
+    async fn new_infers_error_type_without_migrations() {
+        // This should compile without needing to name the error type:
+        let conn = ConnectionBuilder::new()
+            .app_id(1)
+            .in_memory()
+            .await
+            .unwrap()
+            .open()
+            .await
+            .unwrap();
+
+        assert_eq!(get_app_id(&conn).await, 1);
+    }
+
+    #[tokio::test]
+    async fn custom_error_type_is_a_source() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("custom migration error")]
+        struct CustomError;
+
+        let res = ConnectionBuilder::default()
+            .add_migration(1, |_conn| Err(CustomError))
+            .in_memory()
+            .await
+            .unwrap()
+            .open()
+            .await;
+
+        let Err(err) = res else {
+            panic!("migration should fail");
+        };
+        assert!(matches!(
+            err,
+            MigrationsError::MigrationFailed {
+                version: 1,
+                reason: CustomError
+            }
+        ));
+
+        // The migration error is exposed as a source rather than in the message:
+        let err = Error::from(err);
+        let source = std::error::Error::source(&err).unwrap();
+        let source = source.source().unwrap();
+        assert_eq!(source.to_string(), "custom migration error");
+    }
+
+    #[tokio::test]
+    async fn migrations_can_move_captured_values() {
+        let sql = String::from("CREATE TABLE moved ( id INTEGER PRIMARY KEY )");
+
+        let conn = ConnectionBuilder::new()
+            .add_migration(1, move |conn| conn.execute_batch(&sql))
+            .in_memory()
+            .await
+            .unwrap()
+            .open()
+            .await
+            .unwrap();
+
+        assert_eq!(get_user_version(&conn).await, 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_db_version_is_an_error() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test-db1.app");
+
+        // Migrate the database to version 2:
+        let conn = ConnectionBuilder::new()
+            .add_migration(2, users_table)
+            .database(&path)
+            .await
+            .unwrap()
+            .open()
+            .await
+            .unwrap();
+
+        drop(conn);
+
+        // Open again with migrations that don't include version 2:
+        let res = ConnectionBuilder::new()
+            .add_migration(1, users_table)
+            .add_migration(3, data_table)
+            .database(&path)
+            .await
+            .unwrap()
+            .open()
+            .await;
+
+        assert!(matches!(
+            res,
+            Err(MigrationsError::UnknownVersion { db_version: 2 })
+        ));
+
+        // Nothing should have been migrated:
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(get_user_version_rusqlite(&conn), 2);
+    }
+
+    #[tokio::test]
+    async fn non_transactional_migration_leaving_transaction_open_is_an_error() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test-db1.app");
+
+        let res = ConnectionBuilder::new()
+            .add_migration_non_transactionally(1, |conn| {
+                conn.execute_batch("BEGIN")?;
+                users_table(conn)
+            })
+            .database(&path)
+            .await
+            .unwrap()
+            .open()
+            .await;
+
+        assert!(matches!(
+            res,
+            Err(MigrationsError::TransactionLeftOpen { version: 1 })
+        ));
+
+        // The uncommitted changes should have been rolled back:
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(get_user_version_rusqlite(&conn), 0);
+        let tables: i32 = conn
+            .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tables, 0);
     }
 }

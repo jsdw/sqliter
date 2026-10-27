@@ -23,7 +23,7 @@ async fn open_connection() -> Result<Connection, Error> {
     let pending = ConnectionBuilder::new()
         .app_id(APP_ID)
         // Migrations should never change; this list will simply grow over time
-        // To accomodate the updates needed as the app matures.
+        // to accommodate the updates needed as the app matures.
         .add_migration(1, |conn| {
             conn.execute("CREATE TABLE user ( id INTEGER PRIMARY KEY )", ())
                 .map(|_| ())
