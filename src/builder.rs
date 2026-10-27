@@ -1,7 +1,8 @@
 use async_rusqlite::Connection;
 use std::path::Path;
 
-use crate::error::ConnectionBuilderError;
+use crate::MigrationsError;
+use crate::error::ConnectionError;
 use crate::migrations::Migrations;
 
 /// An opinionated connection builder which ultimately hands back
@@ -88,17 +89,22 @@ impl<E: Send + 'static> ConnectionBuilder<E> {
     }
 
     /// Open a connection to an in-memory database.
-    pub async fn open_in_memory(mut self) -> Result<Connection, ConnectionBuilderError<E>> {
-        let conn = self.connection_builder().open_in_memory().await?;
-        self.setup(&conn, true).await?;
-        Ok(conn)
+    pub async fn from_memory(mut self) -> Result<ConnectionPendingMigrations<E>, ConnectionError> {
+        let conn = self
+            .connection_builder()
+            .open_in_memory()
+            .await
+            .map_err(ConnectionError::Db)?;
+
+        let current_db_version = self.setup(&conn, true).await?;
+        Ok(ConnectionPendingMigrations::new(conn, self.migrations, current_db_version))
     }
 
     /// Open a connection to a database at some file.
-    pub async fn open<P: AsRef<Path>>(
+    pub async fn from_file<P: AsRef<Path>>(
         mut self,
         path: P,
-    ) -> Result<Connection, ConnectionBuilderError<E>> {
+    ) -> Result<ConnectionPendingMigrations<E>, ConnectionError> {
         use async_rusqlite::rusqlite::{
             Error::SqliteFailure, OpenFlags, ffi, ffi::ErrorCode::CannotOpen,
         };
@@ -128,15 +134,16 @@ impl<E: Send + 'static> ConnectionBuilder<E> {
                 let conn = self
                     .connection_builder()
                     .open_with_flags(path, flags)
-                    .await?;
+                    .await
+                    .map_err(ConnectionError::Db)?;
                 (conn, true)
             }
             // Something else went wrong; just return the error.
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(ConnectionError::Db(e)),
         };
 
-        self.setup(&conn, is_new).await?;
-        Ok(conn)
+        let current_db_version = self.setup(&conn, is_new).await?;
+        Ok(ConnectionPendingMigrations::new(conn, self.migrations, current_db_version))
     }
 
     // A connection builder.
@@ -151,63 +158,139 @@ impl<E: Send + 'static> ConnectionBuilder<E> {
     }
 
     // Perform any setup on the opened connection.
-    async fn setup(self, conn: &Connection, is_new: bool) -> Result<(), ConnectionBuilderError<E>> {
+    async fn setup(&self, conn: &Connection, is_new: bool) -> Result<i32, ConnectionError> {
+        let app_id = self.app_id;
         conn.call(move |conn| {
             if is_new {
                 // Set up the app ID if this is a new DB.
-                conn.pragma_update(None, "application_id", self.app_id)?;
+                conn.pragma_update(None, "application_id", app_id)
+                    .map_err(ConnectionError::Db)?;
             } else {
                 // Check the app ID if this is not a new DB.
                 let val: i32 =
-                    conn.query_row("SELECT * from pragma_application_id", [], |row| row.get(0))?;
-                if val != self.app_id {
-                    return Err(ConnectionBuilderError::WrongApplicationId(val));
+                    conn.query_row("SELECT * from pragma_application_id", [], |row| row.get(0))
+                        .map_err(ConnectionError::Db)?;
+                if val != app_id {
+                    return Err(ConnectionError::WrongApplicationId(val));
                 }
             }
 
             // Set foreign key constraint checking.
-            conn.pragma_update(None, "foreign_keys", true)?;
+            conn.pragma_update(None, "foreign_keys", true)
+                .map_err(ConnectionError::Db)?;
 
             // Which version is the DB at (ie do we need to run any migrations)
             let user_version: i32 =
-                conn.query_row("SELECT * FROM pragma_user_version", [], |row| row.get(0))?;
+                conn.query_row("SELECT * FROM pragma_user_version", [], |row| row.get(0))
+                    .map_err(ConnectionError::Db)?;
 
-            // Attempt each migration atomically. If a migration fails, we don't
-            // want the DB to have been altered.
-            let mut latest_migration_version = 0;
-            for (version, perform_in_transaction, migration) in self.migrations.iter() {
-                latest_migration_version = version;
-                if version > user_version {
-                    if perform_in_transaction {
-                        // in one transaction, apply a migration and update the db version
-                        // to reflect this. nothing happens on failure; transaction rolled back.
-                        let transaction = conn.transaction()?;
-                        migration(&transaction).map_err(ConnectionBuilderError::Migration)?;
-                        transaction.pragma_update(None, "user_version", version)?;
-                        transaction.commit()?;
-                    } else {
-                        // This is less safe, since any failure inside the migration can lead to
-                        // the database being in an invalid state. Sometimes though, we need to
-                        // control the transaction behaviour inside the migration, so this is
-                        // the best we can do.
-                        migration(conn).map_err(ConnectionBuilderError::Migration)?;
-                        conn.pragma_update(None, "user_version", version)?;
-                    }
-                }
-            }
-
-            if latest_migration_version < user_version {
-                // We don't have migrations up to the version that the db is at already.
-                // This probably means that this app is out of date. Complain, to prevent
-                // an out of date app from trying to use the newer database.
-                return Err(ConnectionBuilderError::OutOfDate {
-                    db_version: user_version,
-                    latest_migration: latest_migration_version,
-                });
-            }
-
-            Ok(())
+            Ok(user_version)
         })
         .await
+    }
+}
+
+/// A connection that has been opened but may still require migrations
+/// to be completed in order to be usable.
+pub struct ConnectionPendingMigrations<E = rusqlite::Error> {
+    // Migrations to apply
+    migrations: Migrations<E>,
+    // The current migration version we're up to in the DB (also 'user_version')
+    current_db_version: i32,
+    // The latest migration version our migrations take us up to
+    latest_migration_version: i32,
+    // The underlying DB connection
+    conn: Connection
+}
+
+impl<E: Send + 'static> ConnectionPendingMigrations<E> {
+    // Crate-only function to init.
+    fn new(conn: Connection, migrations: Migrations<E>, current_db_version: i32) -> Self {
+        // Which version are the given migrations at?
+        let latest_migration_version = migrations.iter()
+            .map(|(version, _, _)| version)
+            .max()
+            .unwrap_or(0);
+
+        ConnectionPendingMigrations {
+            migrations,
+            current_db_version,
+            latest_migration_version,
+            conn,
+        }
+    }
+
+    /// Are the migrations we know about behind the current database?
+    pub fn is_out_of_date(&self) -> bool {
+        self.latest_migration_version < self.current_db_version
+    }
+
+    /// Does this connection need migrations in order to open?
+    pub fn needs_migrations(&self) -> bool {
+        self.current_db_version < self.latest_migration_version
+    }
+
+    /// Hand back a [`rusqlite::Connection`] without performing
+    /// migrations, returning `None` if there are migrations that
+    /// must be performed before the connection is ready.
+    pub async fn open_without_migrations(self) -> Option<Connection> {
+        if self.needs_migrations() {
+            None
+        } else {
+            Some(self.conn)
+        }
+    }
+
+    /// Hand back a [`rusqlite::Connection`] after having performed
+    /// the necessary migrations, returning an error if something
+    /// related to migrating goes wrong.
+    pub async fn open(self) -> Result<Connection, MigrationsError<E>> {
+        let current_db_version = self.current_db_version;
+
+        // If our migrations are out of date, bail without doing anything.
+        if self.is_out_of_date() {
+            return Err(MigrationsError::OutOfDate {
+                db_version: current_db_version,
+                latest_migration: self.latest_migration_version,
+            });
+        }
+
+        // If we need migrations, run them.
+        if self.needs_migrations() {
+            let migrations = self.migrations;
+            self.conn.call(move |conn| {
+                // Attempt each migration atomically. If a migration fails, we don't
+                // want the DB to have been altered.
+                for (version, perform_in_transaction, migration) in migrations.iter() {
+                    if version > current_db_version {
+                        if perform_in_transaction {
+                            // in one transaction, apply a migration and update the db version
+                            // to reflect this. nothing happens on failure; transaction rolled back.
+                            let transaction = conn.transaction()?;
+                            migration(&transaction).map_err(|e| MigrationsError::MigrationFailed {
+                                version,
+                                reason: e,
+                            })?;
+                            transaction.pragma_update(None, "user_version", version)?;
+                            transaction.commit()?;
+                        } else {
+                            // This is less safe, since any failure inside the migration can lead to
+                            // the database being in an invalid state. Sometimes though, we need to
+                            // control the transaction behaviour inside the migration, so this is
+                            // the best we can do.
+                            migration(conn).map_err(|e| MigrationsError::MigrationFailed {
+                                version,
+                                reason: e,
+                            })?;
+                            conn.pragma_update(None, "user_version", version)?;
+                        }
+                    }
+                }
+
+                Ok::<_, MigrationsError<E>>(())
+            }).await?;
+        }
+
+        Ok(self.conn)
     }
 }

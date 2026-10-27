@@ -51,7 +51,7 @@ mod error;
 mod migrations;
 
 pub use builder::ConnectionBuilder;
-pub use error::ConnectionBuilderError;
+pub use error::{ Error, ConnectionError, MigrationsError };
 pub use migrations::Migrations;
 
 // Export these since we are just a thin wrapper around them.
@@ -222,7 +222,7 @@ mod test {
 
         assert!(matches!(
             conn,
-            Err(ConnectionBuilderError::WrongApplicationId(APP_ID))
+            Err(ConnectionError::WrongApplicationId(APP_ID))
         ));
     }
 
@@ -250,7 +250,7 @@ mod test {
 
         assert!(matches!(
             conn,
-            Err(ConnectionBuilderError::OutOfDate {
+            Err(ConnectionError::OutOfDate {
                 db_version: 2,
                 latest_migration: 1
             })
@@ -283,7 +283,7 @@ mod test {
             .open(&path)
             .await;
 
-        assert!(matches!(conn, Err(ConnectionBuilderError::Migration(_))));
+        assert!(matches!(conn, Err(ConnectionError::Migration(_))));
 
         // Check that user version was set to 2:
         let conn = rusqlite::Connection::open(&path).unwrap();
@@ -317,7 +317,7 @@ mod test {
             .open(&path)
             .await;
 
-        assert!(matches!(conn, Err(ConnectionBuilderError::Migration(_))));
+        assert!(matches!(conn, Err(ConnectionError::Migration(_))));
 
         // Check that user version was not updated:
         let conn = rusqlite::Connection::open(&path).unwrap();

@@ -15,6 +15,7 @@ async-rusqlite = "0.6.0"
 # Must match the rusqlite version used by async-rusqlite (only one bundled
 # libsqlite3-sys can be linked); we depend on it directly to enable "bundled".
 rusqlite = { version = "0.41.0", features = ["bundled"] }
+thiserror = "2.0.21"
 
 [dev-dependencies]
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros"] }
